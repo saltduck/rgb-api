@@ -1899,8 +1899,7 @@ dependencies = [
 [[package]]
 name = "rgb-invoicing"
 version = "0.11.1-rc.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a648664c6ebc5a3b56ee3a072ba96edb42d65c3d6570f8a4265d47d31da3a15"
+source = "git+https://github.com/saltduck/rgb-ops?branch=outstack#714c7fcaefcccdbfe17dd53106a3e7770f715cec"
 dependencies = [
  "amplify",
  "baid64",
@@ -1918,8 +1917,7 @@ dependencies = [
 [[package]]
 name = "rgb-ops"
 version = "0.11.1-rc.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe6d840c36960486a2e3c5a82311bdad66d7ea29e5ad63fb2689bed88fdc368f"
+source = "git+https://github.com/saltduck/rgb-ops?branch=outstack#714c7fcaefcccdbfe17dd53106a3e7770f715cec"
 dependencies = [
  "amplify",
  "baid64",
@@ -2047,7 +2045,7 @@ dependencies = [
  "log",
  "once_cell",
  "rustls-pki-types",
- "rustls-webpki 0.103.9",
+ "rustls-webpki 0.103.10",
  "subtle",
  "zeroize",
 ]
@@ -2073,9 +2071,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.9"
+version = "0.103.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7df23109aa6c1567d1c575b9952556388da57401e4ace1d15f79eedad0d8f53"
+checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
 dependencies = [
  "aws-lc-rs",
  "ring",
