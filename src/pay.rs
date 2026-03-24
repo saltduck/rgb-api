@@ -38,6 +38,13 @@ use rgbstd::{
     AssignmentType, ContractId, GraphSeal, Opout, Outpoint, OutputSeal, RevealedData, Transition,
     TransitionType, Txid,
 };
+use {
+    aluvm::Vm,
+    aluvm::isa::{Instr, OutrContext, OutrValue},
+    amplify::confinement::ConfinedOrdMap,
+    crate::vm::RgbIsa,
+};
+use std::cell::RefCell;
 
 use crate::filters::{Filter, WalletFilter};
 use crate::invoice::NonFungible;
@@ -314,21 +321,49 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                 return Err(CompositionError::InsufficientState);
             }
 
-            if *amt > Amount::ZERO {
+            let mut vm = Vm::<Instr<RgbIsa<S>>>::new();
+            let consignment = stock.export_contract(context.contract_id).map_err(|e| e.to_string())?;
+            let scripts = ConfinedOrdMap::from_iter_checked(
+                consignment.scripts.into_iter().map(|s| (s.id(), s.clone()))
+            );
+            let bz_transition_type = TransitionType::with(u16::from(context.transition_type) + u16::from(0x8000));
+            let validator = consignment.schema.transitions.get(&bz_transition_type).and_then(|t| t.transition_schema.validator);
+            let mut received = Amount::ZERO;
+            let mut change = Amount::ZERO;
+            if let Some(validator) = validator {
+                let outstack = RefCell::new(Vec::<OutrValue>::new());
+                let context_ext = OutrContext {
+                    outstack: &outstack,
+                    max_items: 1024,
+                };
+                let result =vm.exec(validator, |id| scripts.get(&id), &context);
+                if result.is_err() {
+                    return Err(CompositionError::Unexpected(result.err().unwrap().to_string()));
+                }
+                let result = result.unwrap();
+                println!("result: {:?}", result);
+                received = result[0];
+                change = result[1];
+            } else {
+                received = *amt;
+                change = sum_inputs - *amt;
+            }
+
+            if received > Amount::ZERO {
                 main_builder = main_builder.add_fungible_state_raw(
                     context.assignment_type,
                     builder_seal,
-                    *amt,
+                    received,
                 )?;
             }
 
             // Pay change
-            if sum_inputs > *amt {
+            if change > Amount::ZERO {
                 let change_seal = create_change_output_seal(context.assignment_type, meta)?;
                 main_builder = main_builder.add_fungible_state_raw(
                     context.assignment_type,
                     change_seal,
-                    sum_inputs - *amt,
+                    change,
                 )?;
             }
         }

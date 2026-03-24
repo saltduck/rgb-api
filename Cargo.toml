@@ -31,6 +31,7 @@ rgb-strict-types = "1.0.1"
 bp-wallet = { version = "0.11.1-alpha.2" }
 rgb-ops = { version = "0.11.1-rc.8" }
 rgb-psbt-utils = { version = "0.11.1-rc.8", path = "psbt" }
+rgb-aluvm = { git = "https://github.com/saltduck/rgb-aluvm", branch = "outstack" }
 indexmap = "2.4.0"
 chrono = "0.4.38"
 serde_crate = { package = "serde", version = "1", features = [
@@ -73,6 +74,7 @@ bdk_wallet = { version = "=2.0.0", default-features = false, optional = true, fe
 bp-wallet = { workspace = true, optional = true }
 rgb-ops = { workspace = true }
 rgb-psbt-utils = { workspace = true }
+rgb-aluvm = { workspace = true }
 indexmap = { workspace = true }
 chrono = { workspace = true }
 serde_crate = { workspace = true, optional = true }
