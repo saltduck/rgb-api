@@ -141,3 +141,4 @@ features = ["all"]
 
 [patch.crates-io]
 rgb-ops = { git = "https://github.com/saltduck/rgb-ops", branch = "outstack" }
+rgb-consensus = { git = "https://github.com/saltduck/rgb-consensus", branch = "outstack" }

@@ -1866,8 +1866,7 @@ dependencies = [
 [[package]]
 name = "rgb-consensus"
 version = "0.11.1-rc.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "598dbfc65e9e77fa852e4eed65a56cc6e34238f6ec7236eb32bc850aa5de7370"
+source = "git+https://github.com/saltduck/rgb-consensus?branch=outstack#7596637672dfa9c59dad52a82c0ca480d7125d19"
 dependencies = [
  "amplify",
  "baid64",
