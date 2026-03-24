@@ -40,7 +40,8 @@ use rgbstd::{
 };
 use {
     aluvm::Vm,
-    aluvm::isa::{Instr, OutrContext, OutrValue},
+    aluvm::reg::CoreRegs,
+    aluvm::isa::{Instr, OutrValue},
     amplify::confinement::ConfinedOrdMap,
     crate::vm::RgbIsa,
 };
@@ -332,18 +333,16 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
             let mut change = Amount::ZERO;
             if let Some(validator) = validator {
                 let outstack = RefCell::new(Vec::<OutrValue>::new());
-                let context_ext = OutrContext {
-                    outstack: &outstack,
-                    max_items: 1024,
-                };
+                let regs = CoreRegs::default();
+                regs.set_outstack_limit(1024);
                 let result =vm.exec(validator, |id| scripts.get(&id), &context);
                 if result.is_err() {
                     return Err(CompositionError::Unexpected(result.err().unwrap().to_string()));
                 }
-                let result = result.unwrap();
-                println!("result: {:?}", result);
-                received = result[0];
-                change = result[1];
+                let outputs = regs.outstack();
+                println!("outputs: {:?}", outputs);
+                received = outputs[0].into().unwrap();
+                change = outputs[1].into().unwrap();
             } else {
                 received = *amt;
                 change = sum_inputs - *amt;
