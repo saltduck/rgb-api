@@ -1893,7 +1893,7 @@ dependencies = [
 [[package]]
 name = "rgb-invoicing"
 version = "0.11.1-rc.8"
-source = "git+https://github.com/saltduck/rgb-ops?branch=outstack#714c7fcaefcccdbfe17dd53106a3e7770f715cec"
+source = "git+https://github.com/saltduck/rgb-ops?branch=outstack#17189b8d13c4fb1c94c903e18f28460d4da1ae33"
 dependencies = [
  "amplify",
  "baid64",
@@ -1911,7 +1911,7 @@ dependencies = [
 [[package]]
 name = "rgb-ops"
 version = "0.11.1-rc.8"
-source = "git+https://github.com/saltduck/rgb-ops?branch=outstack#714c7fcaefcccdbfe17dd53106a3e7770f715cec"
+source = "git+https://github.com/saltduck/rgb-ops?branch=outstack#17189b8d13c4fb1c94c903e18f28460d4da1ae33"
 dependencies = [
  "amplify",
  "baid64",
