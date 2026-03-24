@@ -41,11 +41,10 @@ use rgbstd::{
 use {
     aluvm::Vm,
     aluvm::reg::CoreRegs,
-    aluvm::isa::{Instr, OutrValue},
+    aluvm::isa::Instr,
     amplify::confinement::ConfinedOrdMap,
     crate::vm::RgbIsa,
 };
-use std::cell::RefCell;
 
 use crate::filters::{Filter, WalletFilter};
 use crate::invoice::NonFungible;
@@ -332,7 +331,7 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
             let mut received = Amount::ZERO;
             let mut change = Amount::ZERO;
             if let Some(validator) = validator {
-                let outstack = RefCell::new(Vec::<OutrValue>::new());
+                // let outstack = RefCell::new(Vec::<OutrValue>::new());
                 let regs = CoreRegs::default();
                 regs.set_outstack_limit(1024);
                 let result =vm.exec(validator, |id| scripts.get(&id), &context);
