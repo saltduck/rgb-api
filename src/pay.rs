@@ -40,10 +40,7 @@ use rgbstd::{
 };
 use {
     aluvm::Vm,
-    aluvm::reg::CoreRegs,
-    aluvm::isa::Instr,
-    amplify::confinement::ConfinedOrdMap,
-    crate::vm::RgbIsa,
+    aluvm::isa::{Instr, OutrValue},
 };
 
 use crate::filters::{Filter, WalletFilter};
@@ -321,27 +318,44 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                 return Err(CompositionError::InsufficientState);
             }
 
-            let mut vm = Vm::<Instr<RgbIsa<S>>>::new();
+            // Calculate received and change using bizlogic runner
+            let received: Amount;
+            let change: Amount;
             let consignment = stock.export_contract(context.contract_id).map_err(|e| e.to_string())?;
-            let scripts = ConfinedOrdMap::from_iter_checked(
-                consignment.scripts.into_iter().map(|s| (s.id(), s.clone()))
-            );
-            let bz_transition_type = TransitionType::with(u16::from(context.transition_type) + u16::from(0x8000));
-            let validator = consignment.schema.transitions.get(&bz_transition_type).and_then(|t| t.transition_schema.validator);
-            let mut received = Amount::ZERO;
-            let mut change = Amount::ZERO;
-            if let Some(validator) = validator {
-                // let outstack = RefCell::new(Vec::<OutrValue>::new());
-                let regs = CoreRegs::default();
-                regs.set_outstack_limit(1024);
-                let result =vm.exec(validator, |id| scripts.get(&id), &context);
-                if result.is_err() {
-                    return Err(CompositionError::Unexpected(result.err().unwrap().to_string()));
+            let bz_transition_type = TransitionType::with(u16::from(context.transition_type) + 0x8000u16);
+            let bizlogic_runner = consignment
+                .schema
+                .transitions
+                .get(&bz_transition_type)
+                .and_then(|t| t.transition_schema.validator);
+            if let Some(bizlogic_runner) = bizlogic_runner {
+                let mut vm = Vm::<Instr>::new();
+                let scripts: BTreeMap<_, _> = 
+                    consignment.scripts.into_iter().map(|s| (s.id(), s.clone()))
+                    .collect();
+                vm.registers.set_outstack_limit(1024);
+                let ok = vm.exec(bizlogic_runner, |id| scripts.get(&id), &());
+                if !ok {
+                    return Err(CompositionError::Unexpected(
+                        "bizlogic runner script execution failed".to_string(),
+                    ));
                 }
-                let outputs = regs.outstack();
-                println!("outputs: {:?}", outputs);
-                received = outputs[0].into().unwrap();
-                change = outputs[1].into().unwrap();
+                let outputs = vm.registers.outstack();
+                if outputs.len() < 2 {
+                    return Err(CompositionError::Unexpected(
+                        "validator outstack must provide received and change".to_string(),
+                    ));
+                }
+                let parse_amount = |value: &OutrValue| -> Result<Amount, CompositionError> {
+                    match value {
+                        OutrValue::Int(v) if *v >= 0 => Ok(Amount::from(*v as u64)),
+                        _ => Err(CompositionError::Unexpected(
+                            "validator outstack values must be non-negative integers".to_string(),
+                        )),
+                    }
+                };
+                received = parse_amount(&outputs[0])?;
+                change = parse_amount(&outputs[1])?;
             } else {
                 received = *amt;
                 change = sum_inputs - *amt;
