@@ -44,6 +44,7 @@ use {
 };
 // use rgbstd::vm::{OrdOpRef};
 // use rgbstd::vm::contract::{VmContext, OpInfo};
+use rgbstd::Vout; // 或你本地的 vout 类型
 
 use crate::filters::{Filter, WalletFilter};
 use crate::invoice::NonFungible;
@@ -323,6 +324,7 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
             // Calculate received and change using bizlogic runner
             let mut received: Amount = Amount::from(*amt);
             let mut change: Amount = Amount::from(sum_inputs - *amt);
+            let mut extra_states: Vec<OutrValue> = vec![];
 
             let consignment = stock.export_contract(context.contract_id).map_err(|e| e.to_string())?;
             let bz_transition_type = TransitionType::with(u16::from(context.transition_type) + 0x8000u16);
@@ -338,45 +340,6 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                     let scripts: BTreeMap<_, _> = 
                         consignment.scripts.into_iter().map(|s| (s.id(), s.clone()))
                         .collect();
-                    // let op = OrdOpRef::Transition(transition, witness.txid, *witness_ord, bundle_id);
-                    // let mut state_by_type = BTreeMap::<AssignmentType, Vec<RevealedState>>::new();
-                    // for input in &transition.inputs {
-                    //     if bundle.input_map.get(&input).is_none_or(|v| *v != opid) {
-                    //         return Err(ValidationError::InvalidConsignment(
-                    //             Failure::InputMapTransitionMismatch(bundle.bundle_id(), opid, input),
-                    //         ));
-                    //     }
-                    //     let (seal, state) = self
-                    //         .opout_assigns
-                    //         .borrow_mut()
-                    //         .remove(&input)
-                    //         .and_then(RevealedAssign::into_revealed)
-                    //         .ok_or(ValidationError::InvalidConsignment(Failure::NoPrevState(opid, input)))?;
-                    //     seals.push(seal);
-                    //     state_by_type.entry(input.ty).or_default().push(state);
-                    //     if !self.input_opouts.borrow_mut().insert(input) {
-                    //         return Err(ValidationError::InvalidConsignment(Failure::CyclicGraph(input)));
-                    //     };
-                    // }
-            
-                    // let prev_state = &state_by_type;
-                    // let op_info = OpInfo::with(op.id(), &op, prev_state);
-                    // let vm_context = VmContext {
-                    //     contract_id: context.contract_id,
-                    //     op_info: OpInfo::with(op.id(), &op, prev_state),
-                    //     contract_state: contract_state.clone(),
-                    // };
-                    // struct OpInfo {
-                    //     prev_state: BTreeSet<OutputSeal>,
-                    // };
-                    // struct Context {
-                    //     opinfo: OpInfo,
-                    // };
-                    // let ctx = Context {
-                    //     opinfo: OpInfo {
-                    //         prev_state: prev_outputs.clone().into_iter().collect(),
-                    //     }
-                    // };
                     vm.registers.set_a64(aluvm::reg::Reg32::Reg0, sum_inputs.into());
                     vm.registers.set_a64(aluvm::reg::Reg32::Reg1, (*amt).into());
                     let ok = vm.exec(bizlogic_runner, |id| scripts.get(&id), &());
@@ -388,9 +351,9 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                     // println!("registers: {:?}", vm.registers);
                     let outputs = vm.registers.outstack();
                     println!("outputs: {:?}", outputs);
-                    if outputs.len() != 2 {
+                    if outputs.len() < 2 {
                         return Err(CompositionError::Unexpected(
-                            "validator outstack must provide received and change".to_string(),
+                            "validator outstack must provide at least received and change".to_string(),
                         ));
                     }
                     let parse_amount = |value: &OutrValue| -> Result<Amount, CompositionError> {
@@ -403,6 +366,7 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                     };
                     received = parse_amount(&outputs[0])?;
                     change = parse_amount(&outputs[1])?;
+                    extra_states = outputs[2..].to_vec();
                 }
             }
             
@@ -422,6 +386,32 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                     change_seal,
                     change,
                 )?;
+            }
+
+            // TODO: Pay extra state
+            if !extra_states.is_empty() {
+                // TODO: 现在用的是随机销毁地址，需要改为从outstack中读取
+                let vout = Vout::from(0u32);
+                let seal = GraphSeal::with_blinded_vout(vout, rand::random::<u64>());
+                let burn_seal: BuilderSeal<GraphSeal> = BuilderSeal::Revealed(seal);
+                let parse_amount = |value: &OutrValue| -> Result<Amount, CompositionError> {
+                    match value {
+                        OutrValue::Int(v) if *v >= 0 => Ok(Amount::from(*v as u64)),
+                        _ => Err(CompositionError::Unexpected(
+                            "validator outstack values must be non-negative integers".to_string(),
+                        )),
+                    }
+                };
+                for state in extra_states {
+                    let value = parse_amount(&state)?;
+                    if value > Amount::ZERO {
+                    main_builder = main_builder.add_fungible_state_raw(
+                        context.assignment_type,
+                            burn_seal,
+                            value,
+                        )?;
+                    }
+                }
             }
         }
         InvoiceState::Data(data) => match data {
@@ -581,6 +571,7 @@ pub trait WalletProvider {
         params: TransferParams,
     ) -> Result<(Self::Psbt, PsbtMeta, Transfer), PayError> {
         let (mut psbt, meta) = self.construct_psbt_rgb::<S, H, I, P, O>(stock, invoice, params)?;
+        println!("meta: {:?}", meta);
         // ... here we pass PSBT around signers, if necessary
         let transfer = match self.transfer(stock, invoice, &mut psbt, meta.beneficiary_vout) {
             Ok(transfer) => transfer,
