@@ -390,10 +390,6 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
 
             // TODO: Pay extra state
             if !extra_states.is_empty() {
-                // TODO: 现在用的是随机销毁地址，需要改为从outstack中读取
-                let vout = Vout::from(0u32);
-                let seal = GraphSeal::with_blinded_vout(vout, rand::random::<u64>());
-                let burn_seal: BuilderSeal<GraphSeal> = BuilderSeal::Revealed(seal);
                 let parse_amount = |value: &OutrValue| -> Result<Amount, CompositionError> {
                     match value {
                         OutrValue::Int(v) if *v >= 0 => Ok(Amount::from(*v as u64)),
@@ -402,15 +398,46 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                         )),
                     }
                 };
-                for state in extra_states {
-                    let value = parse_amount(&state)?;
-                    if value > Amount::ZERO {
+                let parse_u32 = |value: &OutrValue| -> Result<u32, CompositionError> {
+                    match value {
+                        OutrValue::Int(v) if *v >= 0 => Ok(*v as u32),
+                        _ => Err(CompositionError::Unexpected(
+                            "validator outstack values must be non-negative integers".to_string(),
+                        )),
+                    }
+                };
+                let parse_txid = |value: &OutrValue| -> Result<Txid, CompositionError> {
+                    match value {
+                        OutrValue::Bytes(v) => {
+                            let hex = std::str::from_utf8(v.as_slice()).map_err(|e| {
+                                CompositionError::Unexpected(format!(
+                                    "validator outstack txhash must be valid UTF-8: {}",
+                                    e
+                                ))
+                            })?;
+                            hex.parse::<Txid>().map_err(|e| {
+                                CompositionError::Unexpected(format!(
+                                    "validator outstack txhash must be a valid txid: {}",
+                                    e
+                                ))
+                            })
+                        },
+                        _ => Err(CompositionError::Unexpected(
+                            "validator outstack txhash must be a hexadecimal string".to_string(),
+                        )),
+                    }
+                };
+                let burn_value = parse_amount(&extra_states[0])?;
+                if burn_value > Amount::ZERO {
+                    let txid = parse_txid(&extra_states[1])?;
+                    let vout = parse_u32(&extra_states[2])?;
+                    let outpoint = Outpoint::new(txid, vout);
+                    let burn_seal = BuilderSeal::Revealed(GraphSeal::rand_from(outpoint));
                     main_builder = main_builder.add_fungible_state_raw(
                         context.assignment_type,
-                            burn_seal,
-                            value,
-                        )?;
-                    }
+                        burn_seal,
+                        burn_value,
+                    )?;
                 }
             }
         }
