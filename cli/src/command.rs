@@ -152,7 +152,7 @@ pub enum Command {
     #[display("invoice")]
     Invoice {
         /// Force address-based invoice
-        #[arg(short('b'), long)]
+        #[arg(short('a'), long)]
         address_based: bool,
 
         /// Assignment state name to use for the invoice
@@ -165,7 +165,7 @@ pub enum Command {
         contract_id: ContractId,
 
         /// Amount of tokens (in the smallest unit) to transfer
-        #[arg(short, long)]
+        #[arg(short('m'), long)]
         amount: Option<u64>,
 
         /// Token index for NFT transfer

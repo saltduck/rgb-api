@@ -321,95 +321,91 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
             }
 
             // Calculate received and change using bizlogic runner
-            let received: Amount;
-            let change: Amount;
+            let mut received: Amount = Amount::from(*amt);
+            let mut change: Amount = Amount::from(sum_inputs - *amt);
+
             let consignment = stock.export_contract(context.contract_id).map_err(|e| e.to_string())?;
             let bz_transition_type = TransitionType::with(u16::from(context.transition_type) + 0x8000u16);
-            let transition = &consignment
+            let transition_details = &consignment
                 .schema
                 .transitions
-                .get(&bz_transition_type)
-                .unwrap()
-                .transition_schema;
-            if let Some(bizlogic_runner) = transition.validator {
-                let mut vm = Vm::<Instr>::new();
-                vm.registers.set_outstack_limit(1024);
-                let scripts: BTreeMap<_, _> = 
-                    consignment.scripts.into_iter().map(|s| (s.id(), s.clone()))
-                    .collect();
-                // let op = OrdOpRef::Transition(transition, witness.txid, *witness_ord, bundle_id);
-                // let mut state_by_type = BTreeMap::<AssignmentType, Vec<RevealedState>>::new();
-                // for input in &transition.inputs {
-                //     if bundle.input_map.get(&input).is_none_or(|v| *v != opid) {
-                //         return Err(ValidationError::InvalidConsignment(
-                //             Failure::InputMapTransitionMismatch(bundle.bundle_id(), opid, input),
-                //         ));
-                //     }
-                //     let (seal, state) = self
-                //         .opout_assigns
-                //         .borrow_mut()
-                //         .remove(&input)
-                //         .and_then(RevealedAssign::into_revealed)
-                //         .ok_or(ValidationError::InvalidConsignment(Failure::NoPrevState(opid, input)))?;
-                //     seals.push(seal);
-                //     state_by_type.entry(input.ty).or_default().push(state);
-                //     if !self.input_opouts.borrow_mut().insert(input) {
-                //         return Err(ValidationError::InvalidConsignment(Failure::CyclicGraph(input)));
-                //     };
-                // }
-        
-                // let prev_state = &state_by_type;
-                // let op_info = OpInfo::with(op.id(), &op, prev_state);
-                // let vm_context = VmContext {
-                //     contract_id: context.contract_id,
-                //     op_info: OpInfo::with(op.id(), &op, prev_state),
-                //     contract_state: contract_state.clone(),
-                // };
-                // struct OpInfo {
-                //     prev_state: BTreeSet<OutputSeal>,
-                // };
-                // struct Context {
-                //     opinfo: OpInfo,
-                // };
-                // let ctx = Context {
-                //     opinfo: OpInfo {
-                //         prev_state: prev_outputs.clone().into_iter().collect(),
-                //     }
-                // };
-                vm.registers.set_a64(aluvm::reg::Reg32::Reg0, sum_inputs.into());
-                vm.registers.set_a64(aluvm::reg::Reg32::Reg1, (*amt).into());
-                let ok = vm.exec(bizlogic_runner, |id| scripts.get(&id), &());
-                if !ok {
-                    return Err(CompositionError::Unexpected(
-                        "bizlogic runner script execution failed".to_string(),
-                    ));
-                }
-                // println!("registers: {:?}", vm.registers);
-                let outputs = vm.registers.outstack();
-                println!("outputs: {:?}", outputs);
-                if outputs.len() != 2 {
-                    return Err(CompositionError::Unexpected(
-                        "validator outstack must provide received and change".to_string(),
-                    ));
-                }
-                let parse_amount = |value: &OutrValue| -> Result<Amount, CompositionError> {
-                    match value {
-                        OutrValue::Int(v) if *v >= 0 => Ok(Amount::from(*v as u64)),
-                        _ => Err(CompositionError::Unexpected(
-                            "validator outstack values must be non-negative integers".to_string(),
-                        )),
+                .get(&bz_transition_type);
+            if let Some(transition_details) = transition_details {
+                let transition = transition_details.transition_schema.clone();
+                if let Some(bizlogic_runner) = transition.validator {
+                    let mut vm = Vm::<Instr>::new();
+                    vm.registers.set_outstack_limit(1024);
+                    let scripts: BTreeMap<_, _> = 
+                        consignment.scripts.into_iter().map(|s| (s.id(), s.clone()))
+                        .collect();
+                    // let op = OrdOpRef::Transition(transition, witness.txid, *witness_ord, bundle_id);
+                    // let mut state_by_type = BTreeMap::<AssignmentType, Vec<RevealedState>>::new();
+                    // for input in &transition.inputs {
+                    //     if bundle.input_map.get(&input).is_none_or(|v| *v != opid) {
+                    //         return Err(ValidationError::InvalidConsignment(
+                    //             Failure::InputMapTransitionMismatch(bundle.bundle_id(), opid, input),
+                    //         ));
+                    //     }
+                    //     let (seal, state) = self
+                    //         .opout_assigns
+                    //         .borrow_mut()
+                    //         .remove(&input)
+                    //         .and_then(RevealedAssign::into_revealed)
+                    //         .ok_or(ValidationError::InvalidConsignment(Failure::NoPrevState(opid, input)))?;
+                    //     seals.push(seal);
+                    //     state_by_type.entry(input.ty).or_default().push(state);
+                    //     if !self.input_opouts.borrow_mut().insert(input) {
+                    //         return Err(ValidationError::InvalidConsignment(Failure::CyclicGraph(input)));
+                    //     };
+                    // }
+            
+                    // let prev_state = &state_by_type;
+                    // let op_info = OpInfo::with(op.id(), &op, prev_state);
+                    // let vm_context = VmContext {
+                    //     contract_id: context.contract_id,
+                    //     op_info: OpInfo::with(op.id(), &op, prev_state),
+                    //     contract_state: contract_state.clone(),
+                    // };
+                    // struct OpInfo {
+                    //     prev_state: BTreeSet<OutputSeal>,
+                    // };
+                    // struct Context {
+                    //     opinfo: OpInfo,
+                    // };
+                    // let ctx = Context {
+                    //     opinfo: OpInfo {
+                    //         prev_state: prev_outputs.clone().into_iter().collect(),
+                    //     }
+                    // };
+                    vm.registers.set_a64(aluvm::reg::Reg32::Reg0, sum_inputs.into());
+                    vm.registers.set_a64(aluvm::reg::Reg32::Reg1, (*amt).into());
+                    let ok = vm.exec(bizlogic_runner, |id| scripts.get(&id), &());
+                    if !ok {
+                        return Err(CompositionError::Unexpected(
+                            "bizlogic runner script execution failed".to_string(),
+                        ));
                     }
-                };
-                received = parse_amount(&outputs[0])?;
-                change = parse_amount(&outputs[1])?;
-            } else {
-                received = *amt;
-                change = sum_inputs - *amt;
-                return Err(CompositionError::Unexpected(
-                    "no bizlogic runner script found".to_string(),
-                ));
+                    // println!("registers: {:?}", vm.registers);
+                    let outputs = vm.registers.outstack();
+                    println!("outputs: {:?}", outputs);
+                    if outputs.len() != 2 {
+                        return Err(CompositionError::Unexpected(
+                            "validator outstack must provide received and change".to_string(),
+                        ));
+                    }
+                    let parse_amount = |value: &OutrValue| -> Result<Amount, CompositionError> {
+                        match value {
+                            OutrValue::Int(v) if *v >= 0 => Ok(Amount::from(*v as u64)),
+                            _ => Err(CompositionError::Unexpected(
+                                "validator outstack values must be non-negative integers".to_string(),
+                            )),
+                        }
+                    };
+                    received = parse_amount(&outputs[0])?;
+                    change = parse_amount(&outputs[1])?;
+                }
             }
-
+            
             if received > Amount::ZERO {
                 main_builder = main_builder.add_fungible_state_raw(
                     context.assignment_type,
