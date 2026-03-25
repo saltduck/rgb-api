@@ -22,6 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 
+// use aluvm::reg::CoreRegs;
 use amplify::confinement::{Confined, U24};
 use chrono::Utc;
 use psrgbt::{RgbOutExt, RgbPropKeyExt, RgbPsbtExt, TapretKeyError, Terminal};
@@ -35,13 +36,14 @@ use rgbstd::rgbcore::seals::txout::{CloseMethod, ExplicitSeal};
 use rgbstd::rgbcore::secp256k1::rand;
 use rgbstd::validation::WitnessOrdProvider;
 use rgbstd::{
-    AssignmentType, ContractId, GraphSeal, Opout, Outpoint, OutputSeal, RevealedData, Transition,
-    TransitionType, Txid,
+    AssignmentType, ContractId, GraphSeal, Opout, Outpoint, OutputSeal, RevealedData, RevealedState, Transition, TransitionType, Txid
 };
 use {
     aluvm::Vm,
     aluvm::isa::{Instr, OutrValue},
 };
+// use rgbstd::vm::{OrdOpRef};
+// use rgbstd::vm::contract::{VmContext, OpInfo};
 
 use crate::filters::{Filter, WalletFilter};
 use crate::invoice::NonFungible;
@@ -323,25 +325,69 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
             let change: Amount;
             let consignment = stock.export_contract(context.contract_id).map_err(|e| e.to_string())?;
             let bz_transition_type = TransitionType::with(u16::from(context.transition_type) + 0x8000u16);
-            let bizlogic_runner = consignment
+            let transition = &consignment
                 .schema
                 .transitions
                 .get(&bz_transition_type)
-                .and_then(|t| t.transition_schema.validator);
-            if let Some(bizlogic_runner) = bizlogic_runner {
+                .unwrap()
+                .transition_schema;
+            if let Some(bizlogic_runner) = transition.validator {
                 let mut vm = Vm::<Instr>::new();
+                vm.registers.set_outstack_limit(1024);
                 let scripts: BTreeMap<_, _> = 
                     consignment.scripts.into_iter().map(|s| (s.id(), s.clone()))
                     .collect();
-                vm.registers.set_outstack_limit(1024);
+                // let op = OrdOpRef::Transition(transition, witness.txid, *witness_ord, bundle_id);
+                // let mut state_by_type = BTreeMap::<AssignmentType, Vec<RevealedState>>::new();
+                // for input in &transition.inputs {
+                //     if bundle.input_map.get(&input).is_none_or(|v| *v != opid) {
+                //         return Err(ValidationError::InvalidConsignment(
+                //             Failure::InputMapTransitionMismatch(bundle.bundle_id(), opid, input),
+                //         ));
+                //     }
+                //     let (seal, state) = self
+                //         .opout_assigns
+                //         .borrow_mut()
+                //         .remove(&input)
+                //         .and_then(RevealedAssign::into_revealed)
+                //         .ok_or(ValidationError::InvalidConsignment(Failure::NoPrevState(opid, input)))?;
+                //     seals.push(seal);
+                //     state_by_type.entry(input.ty).or_default().push(state);
+                //     if !self.input_opouts.borrow_mut().insert(input) {
+                //         return Err(ValidationError::InvalidConsignment(Failure::CyclicGraph(input)));
+                //     };
+                // }
+        
+                // let prev_state = &state_by_type;
+                // let op_info = OpInfo::with(op.id(), &op, prev_state);
+                // let vm_context = VmContext {
+                //     contract_id: context.contract_id,
+                //     op_info: OpInfo::with(op.id(), &op, prev_state),
+                //     contract_state: contract_state.clone(),
+                // };
+                // struct OpInfo {
+                //     prev_state: BTreeSet<OutputSeal>,
+                // };
+                // struct Context {
+                //     opinfo: OpInfo,
+                // };
+                // let ctx = Context {
+                //     opinfo: OpInfo {
+                //         prev_state: prev_outputs.clone().into_iter().collect(),
+                //     }
+                // };
+                vm.registers.set_a64(aluvm::reg::Reg32::Reg0, sum_inputs.into());
+                vm.registers.set_a64(aluvm::reg::Reg32::Reg1, (*amt).into());
                 let ok = vm.exec(bizlogic_runner, |id| scripts.get(&id), &());
                 if !ok {
                     return Err(CompositionError::Unexpected(
                         "bizlogic runner script execution failed".to_string(),
                     ));
                 }
+                // println!("registers: {:?}", vm.registers);
                 let outputs = vm.registers.outstack();
-                if outputs.len() < 2 {
+                println!("outputs: {:?}", outputs);
+                if outputs.len() != 2 {
                     return Err(CompositionError::Unexpected(
                         "validator outstack must provide received and change".to_string(),
                     ));
@@ -359,6 +405,9 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
             } else {
                 received = *amt;
                 change = sum_inputs - *amt;
+                return Err(CompositionError::Unexpected(
+                    "no bizlogic runner script found".to_string(),
+                ));
             }
 
             if received > Amount::ZERO {

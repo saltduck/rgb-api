@@ -152,13 +152,13 @@ pub enum Command {
     #[display("invoice")]
     Invoice {
         /// Force address-based invoice
-        #[arg(short, long)]
+        #[arg(short('b'), long)]
         address_based: bool,
 
         /// Assignment state name to use for the invoice
         ///
         /// If no state name is provided, it will be detected.
-        #[arg(short, long)]
+        #[arg(short('s'), long)]
         assignment_name: Option<String>,
 
         /// Contract identifier

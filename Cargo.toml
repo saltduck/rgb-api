@@ -75,7 +75,9 @@ bdk_wallet = { version = "=2.0.0", default-features = false, optional = true, fe
 bp-wallet = { workspace = true, optional = true }
 rgb-ops = { workspace = true }
 rgb-psbt-utils = { workspace = true }
-rgb-aluvm = { workspace = true }
+rgb-aluvm = { workspace = true, features = [
+    "log",
+] }
 indexmap = { workspace = true }
 chrono = { workspace = true }
 serde_crate = { workspace = true, optional = true }
