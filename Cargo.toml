@@ -30,7 +30,6 @@ rgb-strict-encoding = "1.0.1"
 rgb-strict-types = "1.0.1"
 bp-wallet = { version = "0.11.1-alpha.2" }
 rgb-ops = { git = "https://github.com/saltduck/rgb-ops", branch = "outstack", version = "0.11.1-rc.8" }
-rgb-consensus = { git = "https://github.com/saltduck/rgb-consensus", branch = "outstack", version = "0.11.1-rc.8" }
 rgb-psbt-utils = { version = "0.11.1-rc.8", path = "psbt" }
 rgb-aluvm = { git = "https://github.com/saltduck/rgb-aluvm", branch = "outstack" }
 indexmap = "2.4.0"
@@ -83,6 +82,8 @@ chrono = { workspace = true }
 serde_crate = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
+serde_json = "1.0.149"
+serde-hjson = "1.1.0"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

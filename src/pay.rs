@@ -322,16 +322,13 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
             }
 
             // Calculate received and change using bizlogic runner
-            let mut received: Amount = Amount::from(*amt);
-            let mut change: Amount = Amount::from(sum_inputs - *amt);
-            let mut extra_states: Vec<OutrValue> = vec![];
-
             let consignment = stock.export_contract(context.contract_id).map_err(|e| e.to_string())?;
             let bz_transition_type = TransitionType::with(u16::from(context.transition_type) + 0x8000u16);
             let transition_details = &consignment
                 .schema
                 .transitions
                 .get(&bz_transition_type);
+            let mut bizlogic_runner_executed = false;
             if let Some(transition_details) = transition_details {
                 let transition = transition_details.transition_schema.clone();
                 if let Some(bizlogic_runner) = transition.validator {
@@ -351,7 +348,7 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                     // println!("registers: {:?}", vm.registers);
                     let outputs = vm.registers.outstack();
                     println!("outputs: {:?}", outputs);
-                    if outputs.len() < 2 {
+                    if outputs.len() < 3 {
                         return Err(CompositionError::Unexpected(
                             "validator outstack must provide at least received and change".to_string(),
                         ));
@@ -364,83 +361,121 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                             )),
                         }
                     };
-                    received = parse_amount(&outputs[0])?;
-                    change = parse_amount(&outputs[1])?;
-                    extra_states = outputs[2..].to_vec();
+                    // outputs[0]的格式是这样的字符串："benifery,change,owner,amount"，需要解析为数组后进行遍历处理，不用hjson或者json解析
+                    let s = match &outputs[0] {
+                        OutrValue::Bytes(v) => std::str::from_utf8(v.as_slice()).unwrap(),
+                        _ => panic!("abi must be bytes encoded as 'benifery,change,owner,amount'"),
+                    };
+                    let abi: Vec<&str> = s.split(',').collect();
+                    println!("abi: {:?}", abi);
+                    let mut stashed_seal: Option<BuilderSeal<GraphSeal>> = None;
+                    for (i, value) in abi.iter().enumerate() {
+                        let outr_value = &outputs[i+1];
+                        match *value {
+                            "benifery" => {
+                                let received = parse_amount(outr_value)?;
+                                if received > Amount::ZERO {
+                                    main_builder = main_builder.add_fungible_state_raw(
+                                        context.assignment_type,
+                                        builder_seal,
+                                        received,
+                                    )?
+                                }
+                            },
+                            "change" => {
+                                let change = parse_amount(outr_value)?;
+                                if change > Amount::ZERO {
+                                    let change_seal = create_change_output_seal(context.assignment_type, meta)?;
+                                    main_builder = main_builder.add_fungible_state_raw(
+                                        context.assignment_type,
+                                        change_seal,
+                                        change,
+                                    )?;
+                                }
+                            },
+                            "owner" => {
+                                // 解析state的格式为"txid:vout"，其后必须跟一个state值，然后一同添加到main_builder中
+                                let s = match outr_value {
+                                    OutrValue::Bytes(v) => std::str::from_utf8(v.as_slice())
+                                        .map_err(|e| {
+                                            CompositionError::Unexpected(format!(
+                                                "state must be utf-8 bytes: {}",
+                                                e
+                                            ))
+                                        })?,
+                                    _ => {
+                                        return Err(CompositionError::Unexpected(
+                                            "state must be bytes encoded as 'txid:vout'"
+                                                .to_string(),
+                                        ));
+                                    }
+                                };
+                                let parts: Vec<&str> = s.split(':').collect();
+                                if parts.len() != 2 {
+                                    return Err(CompositionError::Unexpected(
+                                        "state must be in the format of txid:vout".to_string(),
+                                    ));
+                                }
+                                let txid = parts[0].parse::<Txid>().map_err(|e| {
+                                    CompositionError::Unexpected(format!(
+                                        "invalid txid in state '{}': {}",
+                                        parts[0], e
+                                    ))
+                                })?;
+                                let vout = parts[1].parse::<u32>().map_err(|e| {
+                                    CompositionError::Unexpected(format!(
+                                        "invalid vout in state '{}': {}",
+                                        parts[1], e
+                                    ))
+                                })?;
+                                let outpoint = Outpoint::new(txid, vout);
+                                stashed_seal = Some(BuilderSeal::Revealed(GraphSeal::rand_from(outpoint)));
+                            },
+                            "amount" => {
+                                let local_stashed_seal = stashed_seal.ok_or_else(|| {
+                                    CompositionError::Unexpected(
+                                        "state 'amount' encountered before 'owner'".to_string(),
+                                    )
+                                })?;
+                                let amount = parse_amount(outr_value)?;
+                                main_builder = main_builder.add_fungible_state_raw(
+                                    context.assignment_type,
+                                    local_stashed_seal,
+                                    amount,
+                                )?;
+                                stashed_seal = None;
+                        },
+                            _ => return Err(CompositionError::Unexpected(
+                                "state must be in the format of txid:vout:amount".to_string(),
+                            )),
+                        }
+                    }
+                    bizlogic_runner_executed = true;
                 }
             }
             
-            if received > Amount::ZERO {
-                main_builder = main_builder.add_fungible_state_raw(
-                    context.assignment_type,
-                    builder_seal,
-                    received,
-                )?;
-            }
-
-            // Pay change
-            if change > Amount::ZERO {
-                let change_seal = create_change_output_seal(context.assignment_type, meta)?;
-                main_builder = main_builder.add_fungible_state_raw(
-                    context.assignment_type,
-                    change_seal,
-                    change,
-                )?;
-            }
-
-            // TODO: Pay extra state
-            if !extra_states.is_empty() {
-                let parse_amount = |value: &OutrValue| -> Result<Amount, CompositionError> {
-                    match value {
-                        OutrValue::Int(v) if *v >= 0 => Ok(Amount::from(*v as u64)),
-                        _ => Err(CompositionError::Unexpected(
-                            "validator outstack values must be non-negative integers".to_string(),
-                        )),
-                    }
-                };
-                let parse_u32 = |value: &OutrValue| -> Result<u32, CompositionError> {
-                    match value {
-                        OutrValue::Int(v) if *v >= 0 => Ok(*v as u32),
-                        _ => Err(CompositionError::Unexpected(
-                            "validator outstack values must be non-negative integers".to_string(),
-                        )),
-                    }
-                };
-                let parse_txid = |value: &OutrValue| -> Result<Txid, CompositionError> {
-                    match value {
-                        OutrValue::Bytes(v) => {
-                            let hex = std::str::from_utf8(v.as_slice()).map_err(|e| {
-                                CompositionError::Unexpected(format!(
-                                    "validator outstack txhash must be valid UTF-8: {}",
-                                    e
-                                ))
-                            })?;
-                            hex.parse::<Txid>().map_err(|e| {
-                                CompositionError::Unexpected(format!(
-                                    "validator outstack txhash must be a valid txid: {}",
-                                    e
-                                ))
-                            })
-                        },
-                        _ => Err(CompositionError::Unexpected(
-                            "validator outstack txhash must be a hexadecimal string".to_string(),
-                        )),
-                    }
-                };
-                let burn_value = parse_amount(&extra_states[0])?;
-                if burn_value > Amount::ZERO {
-                    let txid = parse_txid(&extra_states[1])?;
-                    let vout = parse_u32(&extra_states[2])?;
-                    let outpoint = Outpoint::new(txid, vout);
-                    let burn_seal = BuilderSeal::Revealed(GraphSeal::rand_from(outpoint));
+            if !bizlogic_runner_executed {
+                let received = Amount::from(*amt);
+                if received > Amount::ZERO {
                     main_builder = main_builder.add_fungible_state_raw(
                         context.assignment_type,
-                        burn_seal,
-                        burn_value,
+                        builder_seal,
+                        received,
+                    )?;
+                }
+
+                // Pay change
+                let change = Amount::from(sum_inputs - *amt);
+                if change > Amount::ZERO {
+                    let change_seal = create_change_output_seal(context.assignment_type, meta)?;
+                    main_builder = main_builder.add_fungible_state_raw(
+                        context.assignment_type,
+                        change_seal,
+                        change,
                     )?;
                 }
             }
-        }
+        },
         InvoiceState::Data(data) => match data {
             NonFungible::FractionedToken(allocation) => {
                 let lookup_state = RevealedData::from(*allocation);
