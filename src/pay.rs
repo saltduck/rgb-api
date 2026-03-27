@@ -340,6 +340,15 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
             let interface: serde_json::Value = serde_json::from_str(interface_str)
                 .map_err(|e| CompositionError::Unexpected(format!("Failed to parse interface as JSON: {}", e)))?;
             println!("interface: {:?}", interface);
+            let transition_details = &consignment
+                .schema
+                .transitions
+                .get(&context.transition_type);
+            let transition_interface = interface.get(transition_details.unwrap().name.to_string()).ok_or_else(|| {
+                CompositionError::Unexpected(
+                    format!("interface JSON must contain \"{}\"", transition_details.unwrap().name.to_string()),
+                )
+            })?;
 
             let bz_transition_type = TransitionType::with(u16::from(context.transition_type) + 0x8000u16);
             let transition_details = &consignment
@@ -349,7 +358,7 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
             let mut bizlogic_runner_executed = false;
             if let Some(transition_details) = transition_details {
                 let transition = transition_details.transition_schema.clone();
-                let inputs = interface.get("parameters").ok_or_else(|| {
+                let inputs = transition_interface.get("parameters").ok_or_else(|| {
                     CompositionError::Unexpected(
                         "interface JSON must contain \"parameters\"".to_string(),
                     )
