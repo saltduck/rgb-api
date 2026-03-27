@@ -52,7 +52,7 @@ use crate::invoice::NonFungible;
 use crate::validation::WitnessResolverError;
 use crate::vm::WitnessOrd;
 use crate::{CompletionError, CompositionError, PayError, WalletError};
-use crate::scripts::{base62_to_hash256, decode_outr_values, run_script};
+use crate::scripts::{base62_to_hash256, outr_value_to_str, run_script};
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct TxParams {
@@ -333,7 +333,10 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
             if interface_outr_values.len() != 1 {
                 return Err(CompositionError::Unexpected("interface outr values must provide only one value".to_string()));
             }
-            let interface = decode_outr_values(&interface_outr_values)?;
+            let interface_str = outr_value_to_str(&interface_outr_values[0])?;
+            println!("interface_str: {:?}", interface_str);
+            let interface: serde_json::Value = serde_json::from_str(interface_str)
+                .map_err(|e| CompositionError::Unexpected(format!("Failed to parse interface as JSON: {}", e)))?;
             println!("interface: {:?}", interface);
 
             let bz_transition_type = TransitionType::with(u16::from(context.transition_type) + 0x8000u16);

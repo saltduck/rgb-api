@@ -52,9 +52,8 @@ pub fn run_script(consignment: &Consignment<false>, lib_id: LibId, pos: u16) -> 
     outputs
 }
 
-pub fn decode_outr_values(outr_values: &[OutrValue]) -> Result<&str, CompositionError> {
-    // outputs[0]的格式是Json字符串需要解析后返回
-    let s = match &outr_values[0] {
+pub fn outr_value_to_str(outr_value: &OutrValue) -> Result<&str, CompositionError> {
+    let s = match &outr_value {
         OutrValue::Bytes(v) => {
             match std::str::from_utf8(v.as_slice()) {
                 Ok(json_str) => json_str,
