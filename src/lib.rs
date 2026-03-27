@@ -34,6 +34,7 @@ mod filters;
 pub mod pay;
 mod errors;
 mod wallet;
+mod scripts;
 
 #[cfg(feature = "bp")]
 pub use descriptor::bp_wallet_integration;

@@ -22,6 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 
+use aluvm::library::LibId;
 // use aluvm::reg::CoreRegs;
 use amplify::confinement::{Confined, U24};
 use chrono::Utc;
@@ -51,6 +52,7 @@ use crate::invoice::NonFungible;
 use crate::validation::WitnessResolverError;
 use crate::vm::WitnessOrd;
 use crate::{CompletionError, CompositionError, PayError, WalletError};
+use crate::scripts::{base62_to_hash256, decode_outr_values, run_script};
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct TxParams {
@@ -323,6 +325,17 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
 
             // Calculate received and change using bizlogic runner
             let consignment = stock.export_contract(context.contract_id).map_err(|e| e.to_string())?;
+            let interface_transition = consignment.schema.transitions.get(&TransitionType::with(65535u16))
+                .ok_or(CompositionError::Unexpected("interface transition not found".to_string()))?;
+            let interface_name = interface_transition.name.to_string();
+            let interface_libid = LibId::from(base62_to_hash256(&interface_name[9..])?);
+            let interface_outr_values = run_script(&consignment, interface_libid, 0);
+            if interface_outr_values.len() != 1 {
+                return Err(CompositionError::Unexpected("interface outr values must provide only one value".to_string()));
+            }
+            let interface = decode_outr_values(&interface_outr_values)?;
+            println!("interface: {:?}", interface);
+
             let bz_transition_type = TransitionType::with(u16::from(context.transition_type) + 0x8000u16);
             let transition_details = &consignment
                 .schema
@@ -345,7 +358,6 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                             "bizlogic runner script execution failed".to_string(),
                         ));
                     }
-                    // println!("registers: {:?}", vm.registers);
                     let outputs = vm.registers.outstack();
                     println!("outputs: {:?}", outputs);
                     if outputs.len() < 3 {
@@ -373,7 +385,8 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                         let outr_value = &outputs[i+1];
                         match *value {
                             "benifery" => {
-                                let received = parse_amount(outr_value)?;
+                                let mut received = parse_amount(outr_value)?;
+                                received = received - Amount::from(1u64);
                                 if received > Amount::ZERO {
                                     main_builder = main_builder.add_fungible_state_raw(
                                         context.assignment_type,
@@ -383,7 +396,8 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                                 }
                             },
                             "change" => {
-                                let change = parse_amount(outr_value)?;
+                                let mut change = parse_amount(outr_value)?;
+                                change = change + Amount::from(1u64);
                                 if change > Amount::ZERO {
                                     let change_seal = create_change_output_seal(context.assignment_type, meta)?;
                                     main_builder = main_builder.add_fungible_state_raw(
