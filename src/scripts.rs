@@ -17,7 +17,7 @@ use chrono::Utc;
 use psrgbt::{RgbOutExt, RgbPropKeyExt, RgbPsbtExt, TapretKeyError, Terminal};
 use rgbstd::bitcoin::hashes::sha256d;
 use rgbstd::containers::{Batch, BuilderSeal, Transfer};
-use rgbstd::contract::{AllocatedState, AssignmentsFilter, BuilderError};
+use rgbstd::contract::{AllocatedState, AssignmentsFilter, BuilderError, TransitionBuilder};
 use rgbstd::invoice::{Amount, Beneficiary, InvoiceState, RgbInvoice};
 use rgbstd::persistence::{IndexProvider, StashInconsistency, StashProvider, StateProvider, Stock};
 use rgbstd::rgbcore::dbc::tapret::{TapretCommitment, TapretProof};
@@ -182,4 +182,125 @@ pub fn generate_transition_parameters(
     }
 
     Ok(script_params)
+}
+
+pub fn parse_amount(value: &OutrValue) -> Result<Amount, CompositionError> {
+    match value {
+        OutrValue::Int(v) if *v >= 0 => Ok(Amount::from(*v as u64)),
+        _ => Err(CompositionError::Unexpected(
+            "validator outstack values must be non-negative integers".to_string(),
+        )),
+    }
+}
+
+pub fn get_interface(consignment: &Consignment<false>) -> Result<serde_json::Value, CompositionError> {
+    let interface_transition = consignment.schema.transitions.get(&TransitionType::with(65535u16))
+        .ok_or(CompositionError::Unexpected("interface transition not found".to_string()))?;
+    let interface_name = interface_transition.name.to_string();
+    let interface_libid = LibId::from(base62_to_hash256(&interface_name[9..])?);
+    let interface_outr_values =
+        run_script(&consignment, interface_libid, 0, Vec::<ScriptParam>::new())
+        .map_err(|e| e.to_string())?;
+    if interface_outr_values.len() != 1 {
+        return Err(CompositionError::Unexpected(
+            "interface outr values must provide only one value".to_string(),
+        ));
+    }
+    let interface_str = outr_value_to_str(&interface_outr_values[0])?;
+    let interface: serde_json::Value = serde_json::from_str(interface_str)
+        .map_err(|e| CompositionError::Unexpected(format!("Failed to parse interface as JSON: {}", e)))?;
+    Ok(interface)
+}
+
+pub fn add_transition_states(
+    abi: &Vec<serde_json::Value>,
+    outputs: &Vec<OutrValue>,
+    mut main_builder: TransitionBuilder,
+    beneficiary_seal: &BuilderSeal<GraphSeal>,
+    change_seal: &BuilderSeal<GraphSeal>,
+) -> Result<TransitionBuilder, CompositionError> {
+    let mut stashed_seal: Option<BuilderSeal<GraphSeal>> = None;
+    for (i, value) in abi.iter().enumerate() {
+        let outr_value = &outputs[i];
+        let abi_name = value.get("name").and_then(|v| v.as_str()).unwrap();
+        let abi_type = AssignmentType::from(value.get("type").and_then(|v| v.as_u64()).unwrap() as u16);
+        match abi_name {
+            "benifery" => {
+                let received = parse_amount(outr_value)?;
+                if received > Amount::ZERO {
+                    main_builder = main_builder.add_fungible_state_raw(
+                        abi_type,
+                        beneficiary_seal.clone(),
+                        received,
+                    )?;
+                }
+            },
+            "change" => {
+                let change = parse_amount(outr_value)?;
+                if change > Amount::ZERO {
+                    main_builder = main_builder.add_fungible_state_raw(
+                        abi_type,
+                        change_seal.clone(),
+                        change,
+                    )?;
+                }
+            },
+            "owner" => {
+                // 解析state的格式为"txid:vout"，其后必须跟一个state值，然后一同添加到main_builder中
+                let s = match outr_value {
+                    OutrValue::Bytes(v) => std::str::from_utf8(v.as_slice())
+                        .map_err(|e| {
+                            CompositionError::Unexpected(format!(
+                                "state must be utf-8 bytes: {}",
+                                e
+                            ))
+                        })?,
+                    _ => {
+                        return Err(CompositionError::Unexpected(
+                            "state must be bytes encoded as 'txid:vout'"
+                                .to_string(),
+                        ));
+                    }
+                };
+                let parts: Vec<&str> = s.split(':').collect();
+                if parts.len() != 2 {
+                    return Err(CompositionError::Unexpected(
+                        "state must be in the format of txid:vout".to_string(),
+                    ));
+                }
+                let txid = parts[0].parse::<Txid>().map_err(|e| {
+                    CompositionError::Unexpected(format!(
+                        "invalid txid in state '{}': {}",
+                        parts[0], e
+                    ))
+                })?;
+                let vout = parts[1].parse::<u32>().map_err(|e| {
+                    CompositionError::Unexpected(format!(
+                        "invalid vout in state '{}': {}",
+                        parts[1], e
+                    ))
+                })?;
+                let outpoint = Outpoint::new(txid, vout);
+                stashed_seal = Some(BuilderSeal::Revealed(GraphSeal::rand_from(outpoint)));
+            },
+            "amount" => {
+                let local_stashed_seal = stashed_seal.ok_or_else(|| {
+                    CompositionError::Unexpected(
+                        "state 'amount' encountered before 'owner'".to_string(),
+                    )
+                })?;
+                let amount = parse_amount(outr_value)?;
+                main_builder = main_builder.add_fungible_state_raw(
+                    abi_type,
+                    local_stashed_seal,
+                    amount,
+                )?;
+                stashed_seal = None;
+        },
+            _ => return Err(CompositionError::Unexpected(
+                "state must be in the format of txid:vout:amount".to_string(),
+            )),
+        }
+    }
+    Ok(main_builder)
 }

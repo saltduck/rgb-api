@@ -52,7 +52,7 @@ use crate::invoice::NonFungible;
 use crate::validation::WitnessResolverError;
 use crate::vm::WitnessOrd;
 use crate::{CompletionError, CompositionError, PayError, WalletError};
-use crate::scripts::{ScriptParam, base62_to_hash256, generate_transition_parameters, outr_value_to_str, run_script};
+use crate::scripts::{ScriptParam, add_transition_states, base62_to_hash256, generate_transition_parameters, get_interface, outr_value_to_str, parse_amount, run_script};
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct TxParams {
@@ -323,158 +323,69 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                 return Err(CompositionError::InsufficientState);
             }
 
-            // Calculate received and change using bizlogic runner
             let consignment = stock.export_contract(context.contract_id).map_err(|e| e.to_string())?;
-            let interface_transition = consignment.schema.transitions.get(&TransitionType::with(65535u16))
-                .ok_or(CompositionError::Unexpected("interface transition not found".to_string()))?;
-            let interface_name = interface_transition.name.to_string();
-            let interface_libid = LibId::from(base62_to_hash256(&interface_name[9..])?);
-            let interface_outr_values =
-                run_script(&consignment, interface_libid, 0, Vec::<ScriptParam>::new())
-                .map_err(|e| e.to_string())?;
-            if interface_outr_values.len() != 1 {
-                return Err(CompositionError::Unexpected("interface outr values must provide only one value".to_string()));
-            }
-            let interface_str = outr_value_to_str(&interface_outr_values[0])?;
-            println!("interface_str: {:?}", interface_str);
-            let interface: serde_json::Value = serde_json::from_str(interface_str)
-                .map_err(|e| CompositionError::Unexpected(format!("Failed to parse interface as JSON: {}", e)))?;
-            println!("interface: {:?}", interface);
-            let transition_details = &consignment
-                .schema
-                .transitions
-                .get(&context.transition_type);
-            let transition_interface = interface.get(transition_details.unwrap().name.to_string()).ok_or_else(|| {
-                CompositionError::Unexpected(
-                    format!("interface JSON must contain \"{}\"", transition_details.unwrap().name.to_string()),
-                )
-            })?;
-
-            let bz_transition_type = TransitionType::with(u16::from(context.transition_type) + 0x8000u16);
-            let transition_details = &consignment
-                .schema
-                .transitions
-                .get(&bz_transition_type);
             let mut bizlogic_runner_executed = false;
-            if let Some(transition_details) = transition_details {
-                let transition = transition_details.transition_schema.clone();
-                let inputs = transition_interface.get("parameters").ok_or_else(|| {
+            if let Ok(interface) = get_interface(&consignment) {
+                // got interface JSON from contract
+                println!("interface: {:?}", interface);
+
+                // got the inteface of this transition
+                let transition_details = &consignment
+                    .schema
+                    .transitions
+                    .get(&context.transition_type);
+                let transition_interface = interface.get(transition_details.unwrap().name.to_string()).ok_or_else(|| {
                     CompositionError::Unexpected(
-                        "interface JSON must contain \"parameters\"".to_string(),
+                        format!("interface JSON must contain \"{}\"", transition_details.unwrap().name.to_string()),
                     )
                 })?;
-                let script_params =
-                    generate_transition_parameters(inputs, sum_inputs, *amt)?;
-                println!("script_params: {:?}", script_params);
-                // return Err(CompositionError::Unexpected("Just for debug".to_string()));
 
-                let outputs = run_script(&consignment, transition.validator.unwrap().lib, transition.validator.unwrap().pos, script_params)?;
-                println!("outputs: {:?}", outputs);
-                if outputs.len() < 3 {
-                    return Err(CompositionError::Unexpected(
-                        "validator outstack must provide at least received and change".to_string(),
-                    ));
-                }
-                let parse_amount = |value: &OutrValue| -> Result<Amount, CompositionError> {
-                    match value {
-                        OutrValue::Int(v) if *v >= 0 => Ok(Amount::from(*v as u64)),
-                        _ => Err(CompositionError::Unexpected(
-                            "validator outstack values must be non-negative integers".to_string(),
-                        )),
+                let bz_transition_type = TransitionType::with(u16::from(context.transition_type) + 0x8000u16);
+                let bl_transition_details = &consignment
+                    .schema
+                    .transitions
+                    .get(&bz_transition_type);
+                if let Some(bl_transition_details) = bl_transition_details {
+                    // set the parameters of this transition
+                    let parameters = transition_interface.get("parameters").ok_or_else(|| {
+                        CompositionError::Unexpected(
+                            "interface JSON must contain \"parameters\"".to_string(),
+                        )
+                    })?;
+                    let script_params =
+                        generate_transition_parameters(parameters, sum_inputs, *amt)?;
+                    println!("script_params: {:?}", script_params);
+                    
+                    // run the transition bizlogic
+                    let bl_transition_validator = bl_transition_details.transition_schema.validator.unwrap();
+                    let outputs = run_script(&consignment, bl_transition_validator.lib, bl_transition_validator.pos, script_params)?;
+                    println!("outputs: {:?}", outputs);
+                    if outputs.len() < 3 {
+                        return Err(CompositionError::Unexpected(
+                            "validator outstack must provide at least received and change".to_string(),
+                        ));
                     }
-                };
-                // outputs[0]的格式是这样的字符串："benifery,change,owner,amount"，需要解析为数组后进行遍历处理，不用hjson或者json解析
-                let s = match &outputs[0] {
-                    OutrValue::Bytes(v) => std::str::from_utf8(v.as_slice()).unwrap(),
-                    _ => panic!("abi must be bytes encoded as 'benifery,change,owner,amount'"),
-                };
-                let abi: Vec<&str> = s.split(',').collect();
-                println!("abi: {:?}", abi);
-                let mut stashed_seal: Option<BuilderSeal<GraphSeal>> = None;
-                for (i, value) in abi.iter().enumerate() {
-                    let outr_value = &outputs[i+1];
-                    match *value {
-                        "benifery" => {
-                            let received = parse_amount(outr_value)?;
-                            if received > Amount::ZERO {
-                                main_builder = main_builder.add_fungible_state_raw(
-                                    context.assignment_type,
-                                    builder_seal,
-                                    received,
-                                )?
-                            }
-                        },
-                        "change" => {
-                            let change = parse_amount(outr_value)?;
-                            if change > Amount::ZERO {
-                                let change_seal = create_change_output_seal(context.assignment_type, meta)?;
-                                main_builder = main_builder.add_fungible_state_raw(
-                                    context.assignment_type,
-                                    change_seal,
-                                    change,
-                                )?;
-                            }
-                        },
-                        "owner" => {
-                            // 解析state的格式为"txid:vout"，其后必须跟一个state值，然后一同添加到main_builder中
-                            let s = match outr_value {
-                                OutrValue::Bytes(v) => std::str::from_utf8(v.as_slice())
-                                    .map_err(|e| {
-                                        CompositionError::Unexpected(format!(
-                                            "state must be utf-8 bytes: {}",
-                                            e
-                                        ))
-                                    })?,
-                                _ => {
-                                    return Err(CompositionError::Unexpected(
-                                        "state must be bytes encoded as 'txid:vout'"
-                                            .to_string(),
-                                    ));
-                                }
-                            };
-                            let parts: Vec<&str> = s.split(':').collect();
-                            if parts.len() != 2 {
-                                return Err(CompositionError::Unexpected(
-                                    "state must be in the format of txid:vout".to_string(),
-                                ));
-                            }
-                            let txid = parts[0].parse::<Txid>().map_err(|e| {
-                                CompositionError::Unexpected(format!(
-                                    "invalid txid in state '{}': {}",
-                                    parts[0], e
-                                ))
-                            })?;
-                            let vout = parts[1].parse::<u32>().map_err(|e| {
-                                CompositionError::Unexpected(format!(
-                                    "invalid vout in state '{}': {}",
-                                    parts[1], e
-                                ))
-                            })?;
-                            let outpoint = Outpoint::new(txid, vout);
-                            stashed_seal = Some(BuilderSeal::Revealed(GraphSeal::rand_from(outpoint)));
-                        },
-                        "amount" => {
-                            let local_stashed_seal = stashed_seal.ok_or_else(|| {
-                                CompositionError::Unexpected(
-                                    "state 'amount' encountered before 'owner'".to_string(),
-                                )
-                            })?;
-                            let amount = parse_amount(outr_value)?;
-                            main_builder = main_builder.add_fungible_state_raw(
-                                context.assignment_type,
-                                local_stashed_seal,
-                                amount,
-                            )?;
-                            stashed_seal = None;
-                    },
-                        _ => return Err(CompositionError::Unexpected(
-                            "state must be in the format of txid:vout:amount".to_string(),
-                        )),
-                    }
+
+                    // get the returns interface of this transition
+                    let abi = transition_interface.get("returns").ok_or_else(|| {
+                        CompositionError::Unexpected(
+                            "interface JSON must contain \"returns\"".to_string(),
+                        )
+                    })?.as_array().unwrap();
+                    println!("abi: {:?}", abi);
+
+                    // add wanted transition state to main_builder
+                    let change_seal = create_change_output_seal(context.assignment_type, meta)?;
+                    main_builder = add_transition_states(
+                        abi,
+                        &outputs,
+                        main_builder,
+                        &builder_seal,
+                        &change_seal,
+                    )?;
+                    bizlogic_runner_executed = true;
                 }
-                bizlogic_runner_executed = true;
             }
-            
             if !bizlogic_runner_executed {
                 let received = Amount::from(*amt);
                 if received > Amount::ZERO {
