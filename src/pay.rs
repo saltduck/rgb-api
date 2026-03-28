@@ -360,7 +360,7 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                     let bl_transition_validator = bl_transition_details.transition_schema.validator.unwrap();
                     let outputs = run_script(&consignment, bl_transition_validator.lib, bl_transition_validator.pos, script_params)?;
                     println!("outputs: {:?}", outputs);
-                    if outputs.len() < 3 {
+                    if outputs.len() < 2 {
                         return Err(CompositionError::Unexpected(
                             "validator outstack must provide at least received and change".to_string(),
                         ));
