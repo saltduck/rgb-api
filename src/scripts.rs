@@ -91,7 +91,7 @@ pub fn run_script<const TRANSFER: bool>(
 
     let mut vm = Vm::<Instr<RgbIsa<M>>>::new();
     vm.registers.set_outstack_limit(1024);
-
+println!("params: {:?}", params);
     for param in params {
         match param.reg_name.as_str() {
             "a64" => {
@@ -122,9 +122,12 @@ pub fn run_script<const TRANSFER: bool>(
         }
     }
 
+println!("run_script: {:?}", consignment.scripts);
     let scripts: BTreeMap<_, _> =
         consignment.scripts.iter().map(|s| (s.id(), s.clone())).collect();
-
+println!("scripts: {:?}", scripts);
+println!("lib_id: {:?}", lib_id);
+println!("pos: {:?}", pos);
     let prev_state = BTreeMap::new();
     let ord_op = OrdOpRef::Genesis(consignment.genesis());
     let wire = VmContextWire {
@@ -268,17 +271,17 @@ pub fn generate_transition_parameters(
     };
     let mut script_params = Vec::new();
     for input in rows {
-        let param_type = input.get("type").and_then(json_semantic_type_id);
+        let param_reg = input.get("reg").and_then(|v| v.as_str()).unwrap_or_default();
         let param_name = input.get("name").and_then(|v| v.as_str()).unwrap_or_default();
         match param_name {
-            "inputs" | "sum_inputs" if param_type == Some(SEM_TYPE_OS_ASSET) => {
+            "inputs" | "sum_inputs" if param_reg == "a64" => {
                 script_params.push(ScriptParam {
                     reg_name: "a64".to_string(),
                     idx: 0,
                     value: u64::from(sum_inputs).to_string(),
                 });
             }
-            "amount" | "amt" if param_type == Some(SEM_TYPE_OS_ASSET) => {
+            "amount" | "amt" if param_reg == "a64" => {
                 script_params.push(ScriptParam {
                     reg_name: "a64".to_string(),
                     idx: 1,
@@ -289,7 +292,7 @@ pub fn generate_transition_parameters(
                 return Err(CompositionError::Unexpected(format!(
                     "Invalid parameter name: {} for type: {}",
                     param_name,
-                    param_type.unwrap_or_default(),
+                    param_reg,
                 )));
             }
         }
@@ -317,8 +320,8 @@ pub fn generate_transition_parameters_from_args(
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        let param_type = param
-            .get("type")
+        let param_reg = param
+            .get("reg")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         let value = match param_name {
@@ -334,7 +337,7 @@ pub fn generate_transition_parameters_from_args(
                 .clone(),
         };
         script_params.push(ScriptParam {
-            reg_name: param_type.to_string(),
+            reg_name: param_reg.to_string(),
             idx: idx as u8,
             value,
         });
@@ -435,7 +438,7 @@ pub fn parse_hash256(value: &OutrValue) -> Result<[u8; 32], CompositionError> {
 
 pub fn get_interface<const TRANSFER: bool>(
     consignment: &Consignment<TRANSFER>,
-) -> Result<serde_json::Value, CompositionError> {
+) -> Result<(serde_json::Value, LibId), CompositionError> {
     let interface_transition = consignment.schema.transitions.get(&TransitionType::with(65535u16))
         .ok_or(CompositionError::Unexpected("interface transition not found".to_string()))?;
     let interface_name = interface_transition.name.to_string();
@@ -455,7 +458,7 @@ pub fn get_interface<const TRANSFER: bool>(
     let interface_str = outr_value_to_str(&interface_outr_values[0])?;
     let interface: serde_json::Value = serde_json::from_str(interface_str)
         .map_err(|e| CompositionError::Unexpected(format!("Failed to parse interface as JSON: {}", e)))?;
-    Ok(interface)
+    Ok((interface, interface_libid))
 }
 
 pub fn add_transition_states(
@@ -466,6 +469,8 @@ pub fn add_transition_states(
     change_seal: &BuilderSeal<GraphSeal>,
 ) -> Result<TransitionBuilder, CompositionError> {
     let mut stashed_seal: Option<BuilderSeal<GraphSeal>> = None;
+println!("add_transition_states: abi= {:?}", abi);
+println!("add_transition_states: outputs= {:?}", outputs);
     for (i, value) in abi.iter().enumerate() {
         let outr_value = &outputs[i];
 println!("outr_value: {:?}", outr_value);
@@ -477,6 +482,11 @@ println!("outr_value: {:?}", outr_value);
                     "ABI entry at index {i}: missing or non-string 'name'"
                 ))
             })?;
+        let abi_reg = value.get("reg").and_then(|v| v.as_str()).ok_or_else(|| {
+            CompositionError::Unexpected(format!(
+                "ABI entry at index {i} (name={abi_name:?}): missing or invalid 'reg' (expect string)"
+            ))
+        })?;
         let type_raw = value.get("type").and_then(json_semantic_type_id).ok_or_else(|| {
             CompositionError::Unexpected(format!(
                 "ABI entry at index {i} (name={abi_name:?}): missing or invalid 'type' (expect integer, whole float, or decimal string)"
@@ -486,9 +496,9 @@ println!("outr_value: {:?}", outr_value);
 
         match abi_name {
             "benifery" => {
-                if type_raw != SEM_TYPE_OS_ASSET {
+                if abi_reg != "a64" {
                     return Err(CompositionError::Unexpected(format!(
-                        "ABI 'benifery' at index {i}: expected type {SEM_TYPE_OS_ASSET} (OS_ASSET), got {type_raw}"
+                        "ABI 'benifery' at index {i}: expected reg {abi_reg} (expected a64)",
                     )));
                 }
                 let received = parse_amount(outr_value)?;
@@ -500,8 +510,8 @@ println!("outr_value: {:?}", outr_value);
                     )?;
                 }
             }
-            "change" => match type_raw {
-                SEM_TYPE_OS_ASSET => {
+            "change" => match abi_reg {
+                "a64" => {
                     let change = parse_amount(outr_value)?;
                     if change > Amount::ZERO {
                         main_builder = main_builder.add_fungible_state_raw(
@@ -511,7 +521,7 @@ println!("outr_value: {:?}", outr_value);
                         )?;
                     }
                 }
-                SEM_TYPE_OS_HASH => {
+                "r256" => {
                     let hash = parse_hash256(outr_value)?;
                     let payload = Confined::try_from_iter(hash.iter().copied()).map_err(|e| {
                         CompositionError::Unexpected(format!("OS_HASH RevealedData: {e}"))
@@ -522,7 +532,7 @@ println!("outr_value: {:?}", outr_value);
                         RevealedData::new(payload),
                     )?;
                 }
-                SEM_TYPE_OS_OUTPOINT => {
+                "s16" => {
                     let raw = parse_outpoint_payload(outr_value)?;
                     let payload = Confined::try_from_iter(raw.into_iter()).map_err(|e| {
                         CompositionError::Unexpected(format!("OS_OUTPOINT RevealedData: {e}"))
@@ -535,14 +545,14 @@ println!("outr_value: {:?}", outr_value);
                 }
                 other => {
                     return Err(CompositionError::Unexpected(format!(
-                        "ABI 'change' at index {i}: unsupported type {other} (expected {SEM_TYPE_OS_ASSET} OS_ASSET, {SEM_TYPE_OS_HASH} OS_HASH or {SEM_TYPE_OS_OUTPOINT} OS_OUTPOINT)"
+                        "ABI 'change' at index {i}: unsupported reg {other} (expected a64, r256 or s16)"
                     )));
                 }
             },
             "owner" => {
-                if type_raw != SEM_TYPE_OS_OUTPOINT {
+                if abi_reg != "s16" {
                     return Err(CompositionError::Unexpected(format!(
-                        "ABI 'owner' at index {i}: expected type {SEM_TYPE_OS_OUTPOINT} (OS_OUTPOINT), got {type_raw}"
+                        "ABI 'owner' at index {i}: expected reg {abi_reg} (expected s16)",
                     )));
                 }
                 // 解析state的格式为"txid:vout"，其后必须跟一个state值，然后一同添加到main_builder中
@@ -582,9 +592,9 @@ println!("outr_value: {:?}", outr_value);
                 stashed_seal = Some(BuilderSeal::Revealed(GraphSeal::rand_from(outpoint)));
             }
             "amount" => {
-                if type_raw != SEM_TYPE_OS_ASSET {
+                if abi_reg != "a64" {
                     return Err(CompositionError::Unexpected(format!(
-                        "ABI 'amount' at index {i}: expected type {SEM_TYPE_OS_ASSET} (OS_ASSET), got {type_raw}"
+                        "ABI 'amount' at index {i}: expected reg {abi_reg} (expected a64)",
                     )));
                 }
                 let local_stashed_seal = stashed_seal.ok_or_else(|| {

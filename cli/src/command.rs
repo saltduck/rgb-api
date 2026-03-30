@@ -44,9 +44,7 @@ use rgb::schema::SchemaId;
 use rgb::validation::{ValidationConfig, Validity};
 use rgb::vm::{RgbIsa, WitnessOrd};
 use rgb::{
-    Allocation, BundleId, ContractId, GenesisSeal, GraphSeal, Identity, OpId, Outpoint, OutputSeal,
-    OwnedFraction, RgbDescr, RgbWallet, StateType, TokenIndex, TransferParams, Txid, WalletError,
-    WalletProvider,
+    Allocation, BundleId, CompositionError, ContractId, GenesisSeal, GraphSeal, Identity, OpId, Outpoint, OutputSeal, OwnedFraction, RgbDescr, RgbWallet, StateType, TokenIndex, TransferParams, Txid, WalletError, WalletProvider
 };
 use rgbstd::contract::{AllocatedState, AssignmentsFilter, ContractData, ContractOp};
 use rgbstd::persistence::MemContractState;
@@ -953,7 +951,7 @@ impl Exec for RgbArgs {
                     .stock()
                     .export_contract(*contract_id)
                     .map_err(|e| e.to_string())?;
-                let interface = get_interface(&export).map_err(|e| e.to_string())?;
+                let (interface, interface_libid) = get_interface(&export).map_err(|e| e.to_string())?;
 
                 let (&transition_type, transition_details) = export
                     .schema
@@ -975,27 +973,29 @@ impl Exec for RgbArgs {
                         ))
                     })?;
 
-                let bz_transition_type =
-                    TransitionType::with(u16::from(transition_type) + 0x8000u16);
-                let bl_transition_details = export
-                    .schema
-                    .transitions
-                    .get(&bz_transition_type)
-                    .ok_or_else(|| {
-                        WalletError::Custom(format!(
-                            "bizlogic transition 0x{:04x} not found in schema",
-                            u16::from(bz_transition_type)
-                        ))
-                    })?;
+                // let bz_transition_type =
+                //     TransitionType::with(u16::from(transition_type) + 0x8000u16);
+                // let bl_transition_details = export
+                //     .schema
+                //     .transitions
+                //     .get(&bz_transition_type)
+                //     .ok_or_else(|| {
+                //         WalletError::Custom(format!(
+                //             "bizlogic transition 0x{:04x} not found in schema",
+                //             u16::from(bz_transition_type)
+                //         ))
+                //     })?;
 
-                let bl_validator = bl_transition_details
-                    .transition_schema
-                    .validator
-                    .ok_or_else(|| {
-                        WalletError::Custom(
-                            "bizlogic transition has no validator script".to_string(),
-                        )
-                    })?;
+                // let bl_validator = bl_transition_details
+                //     .transition_schema
+                //     .validator
+                //     .ok_or_else(|| {
+                //         WalletError::Custom(
+                //             "bizlogic transition has no validator script".to_string(),
+                //         )
+                //     })?;
+                let transition_script = transition_interface.get("script").unwrap();
+                let script_pos = transition_script.get("position").unwrap().as_u64().unwrap() as u16;
 
                 let close_method = wallet.wallet().close_method();
 
@@ -1136,7 +1136,7 @@ impl Exec for RgbArgs {
                         .map_err(|e| e.to_string())?;
 
                 let outputs =
-                    run_script(&export, bl_validator.lib, bl_validator.pos, script_params)
+                    run_script(&export, interface_libid, script_pos, script_params)
                         .map_err(|e| e.to_string())?;
 
                 let change_seal =

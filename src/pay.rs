@@ -324,8 +324,9 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
             }
 
             let consignment = stock.export_contract(context.contract_id).map_err(|e| e.to_string())?;
+println!("consignment: {:?}", consignment);
             let mut bizlogic_runner_executed = false;
-            if let Ok(interface) = get_interface(&consignment) {
+            if let Ok((interface, interface_libid)) = get_interface(&consignment) {
                 // got interface JSON from contract
                 println!("interface: {:?}", interface);
 
@@ -340,12 +341,13 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                     )
                 })?;
 
-                let bz_transition_type = TransitionType::with(u16::from(context.transition_type) + 0x8000u16);
-                let bl_transition_details = &consignment
-                    .schema
-                    .transitions
-                    .get(&bz_transition_type);
-                if let Some(bl_transition_details) = bl_transition_details {
+                // let bz_transition_type = TransitionType::with(u16::from(context.transition_type) + 0x8000u16);
+                // let bl_transition_details = &consignment
+                //     .schema
+                //     .transitions
+                //     .get(&bz_transition_type);
+                // if let Some(bl_transition_details) = bl_transition_details {
+                if let Some(transition_script) = transition_interface.get("script") {
                     // set the parameters of this transition
                     let parameters = transition_interface.get("parameters").ok_or_else(|| {
                         CompositionError::Unexpected(
@@ -357,8 +359,14 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                     println!("script_params: {:?}", script_params);
                     
                     // run the transition bizlogic
-                    let bl_transition_validator = bl_transition_details.transition_schema.validator.unwrap();
-                    let outputs = run_script(&consignment, bl_transition_validator.lib, bl_transition_validator.pos, script_params)?;
+                    // let bl_transition_validator = bl_transition_details.transition_schema.validator.unwrap();
+                    let pos = transition_script.get("position").unwrap().as_u64().unwrap() as u16;
+                    let outputs = run_script(
+                        &consignment,
+                        interface_libid,
+                        pos,
+                        script_params
+                    )?;
                     println!("outputs: {:?}", outputs);
                     if outputs.len() < 2 {
                         return Err(CompositionError::Unexpected(
@@ -565,7 +573,6 @@ pub trait WalletProvider {
         params: TransferParams,
     ) -> Result<(Self::Psbt, PsbtMeta, Transfer), PayError> {
         let (mut psbt, meta) = self.construct_psbt_rgb::<S, H, I, P, O>(stock, invoice, params)?;
-        println!("meta: {:?}", meta);
         // ... here we pass PSBT around signers, if necessary
         let transfer = match self.transfer(stock, invoice, &mut psbt, meta.beneficiary_vout) {
             Ok(transfer) => transfer,
