@@ -14,7 +14,7 @@ use aluvm::data::{ByteStr, Number};
 use aluvm::library::{LibId, LibSite};
 use aluvm::reg::{Reg8, Reg16, Reg32, RegAFR, RegR, RegS};
 // use aluvm::reg::CoreRegs;
-use amplify::confinement::{Confined, TinyBlob, U24};
+use amplify::confinement::{Confined, TinyBlob, U24, U32};
 use amplify::hex::FromHex;
 use amplify::num::u5;
 use chrono::Utc;
@@ -37,6 +37,7 @@ use {
     aluvm::Vm,
     aluvm::isa::{Instr, InstructionSet, OutrValue},
 };
+use strict_types::StrictSerialize;
 use rgbstd::Vout; // 或你本地的 vout 类型
 
 use crate::filters::{Filter, WalletFilter};
@@ -234,6 +235,26 @@ fn json_semantic_type_id(v: &serde_json::Value) -> Option<u64> {
     }
 }
 
+/// Principal owned assignment type for this transition (same role as `PaymentContext::assignment_type` in `pay`).
+/// Uses the interface `returns` entry named `benifery` if present; otherwise `fallback` (e.g. schema default).
+pub fn main_assignment_type_from_returns_abi(
+    returns_abi: &[serde_json::Value],
+    fallback: AssignmentType,
+) -> Result<AssignmentType, CompositionError> {
+    for value in returns_abi {
+        if value.get("name").and_then(|v| v.as_str()) != Some("benifery") {
+            continue;
+        }
+        let type_raw = value.get("type").and_then(json_semantic_type_id).ok_or_else(|| {
+            CompositionError::Unexpected(
+                "ABI returns entry 'benifery': missing or invalid 'type'".to_string(),
+            )
+        })?;
+        return Ok(AssignmentType::from(type_raw as u16));
+    }
+    Ok(fallback)
+}
+
 /// `inputs` 为 interface JSON 里的 `inputs` 数组；`sum_inputs` / `amt` 为本次支付侧已知金额。
 pub fn generate_transition_parameters(
     parameters: &serde_json::Value,
@@ -333,6 +354,45 @@ pub fn parse_amount(value: &OutrValue) -> Result<Amount, CompositionError> {
     }
 }
 
+pub fn parse_string(value: &OutrValue) -> Result<Vec<u8>, CompositionError> {
+    match value {
+        OutrValue::Bytes(v) => Ok(v.as_slice().to_vec()),
+        other => Err(CompositionError::Unexpected(format!(
+            "string/data must be bytes OUTR value, got {other:?}"
+        ))),
+    }
+}
+
+fn parse_outpoint_payload(value: &OutrValue) -> Result<Vec<u8>, CompositionError> {
+    let s = match value {
+        OutrValue::Bytes(v) => std::str::from_utf8(v.as_slice()).map_err(|e| {
+            CompositionError::Unexpected(format!("OS_OUTPOINT must be utf-8 bytes 'txid:vout': {e}"))
+        })?,
+        other => {
+            return Err(CompositionError::Unexpected(format!(
+                "OS_OUTPOINT must be bytes encoded as 'txid:vout', got {other:?}"
+            )))
+        }
+    };
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 2 {
+        return Err(CompositionError::Unexpected(
+            "OS_OUTPOINT must be in the format txid:vout".to_string(),
+        ));
+    }
+    let txid = parts[0].parse::<Txid>().map_err(|e| {
+        CompositionError::Unexpected(format!("invalid txid in OS_OUTPOINT '{}': {}", parts[0], e))
+    })?;
+    let vout = parts[1].parse::<u32>().map_err(|e| {
+        CompositionError::Unexpected(format!("invalid vout in OS_OUTPOINT '{}': {}", parts[1], e))
+    })?;
+    let outpoint = Outpoint::new(txid, vout);
+    let bytes = outpoint
+        .to_strict_serialized::<U32>()
+        .map_err(|e| CompositionError::Unexpected(format!("OS_OUTPOINT strict encode failed: {e}")))?;
+    Ok(bytes.to_vec())
+}
+
 /// Parses sha256 from AluVM outstack: **32 raw bytes**, or **64 hex digits** (optional `0x`), UTF-8.
 pub fn parse_hash256(value: &OutrValue) -> Result<[u8; 32], CompositionError> {
     match value {
@@ -408,6 +468,7 @@ pub fn add_transition_states(
     let mut stashed_seal: Option<BuilderSeal<GraphSeal>> = None;
     for (i, value) in abi.iter().enumerate() {
         let outr_value = &outputs[i];
+println!("outr_value: {:?}", outr_value);
         let abi_name = value
             .get("name")
             .and_then(|v| v.as_str())
@@ -461,9 +522,20 @@ pub fn add_transition_states(
                         RevealedData::new(payload),
                     )?;
                 }
+                SEM_TYPE_OS_OUTPOINT => {
+                    let raw = parse_outpoint_payload(outr_value)?;
+                    let payload = Confined::try_from_iter(raw.into_iter()).map_err(|e| {
+                        CompositionError::Unexpected(format!("OS_OUTPOINT RevealedData: {e}"))
+                    })?;
+                    main_builder = main_builder.add_data_raw(
+                        abi_type,
+                        change_seal.clone(),
+                        RevealedData::new(payload),
+                    )?;
+                }
                 other => {
                     return Err(CompositionError::Unexpected(format!(
-                        "ABI 'change' at index {i}: unsupported type {other} (expected {SEM_TYPE_OS_ASSET} OS_ASSET or {SEM_TYPE_OS_HASH} OS_HASH)"
+                        "ABI 'change' at index {i}: unsupported type {other} (expected {SEM_TYPE_OS_ASSET} OS_ASSET, {SEM_TYPE_OS_HASH} OS_HASH or {SEM_TYPE_OS_OUTPOINT} OS_OUTPOINT)"
                     )));
                 }
             },
@@ -537,4 +609,33 @@ pub fn add_transition_states(
         }
     }
     Ok(main_builder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use strict_types::StrictDeserialize;
+
+    #[test]
+    fn parse_outpoint_payload_roundtrip() {
+        let txid =
+            "c5c3f8d1d75c39c1ff537f3f96286ab15fcd58ffdf2d66e9d869c52f55ddb35d";
+        let vout = 1u32;
+        let raw = format!("{txid}:{vout}").into_bytes();
+        let outr = OutrValue::Bytes(raw);
+
+        let payload = parse_outpoint_payload(&outr).expect("must parse valid outpoint");
+        let payload = Confined::try_from(payload).expect("payload must fit confinement");
+        let decoded = Outpoint::from_strict_serialized::<U32>(payload)
+            .expect("must decode strict-serialized outpoint");
+
+        assert_eq!(decoded.txid.to_string(), txid);
+        assert_eq!(decoded.vout, vout);
+    }
+
+    #[test]
+    fn parse_outpoint_payload_rejects_invalid_format() {
+        let outr = OutrValue::Bytes(b"not-an-outpoint".to_vec());
+        assert!(parse_outpoint_payload(&outr).is_err());
+    }
 }

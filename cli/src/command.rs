@@ -940,7 +940,7 @@ impl Exec for RgbArgs {
                 use rgb::pay::{build_extra_transitions, create_change_output_seal};
                 use rgb::scripts::{
                     add_transition_states, generate_transition_parameters_from_args, get_interface,
-                    run_script,
+                    main_assignment_type_from_returns_abi, run_script,
                 };
                 use rgb::validation::WitnessOrdProvider;
                 use rgb::vm::WitnessOrd;
@@ -955,7 +955,7 @@ impl Exec for RgbArgs {
                     .map_err(|e| e.to_string())?;
                 let interface = get_interface(&export).map_err(|e| e.to_string())?;
 
-                let (&transition_type, _) = export
+                let (&transition_type, transition_details) = export
                     .schema
                     .transitions
                     .iter()
@@ -1063,12 +1063,31 @@ impl Exec for RgbArgs {
                     ))
                 });
 
+                let abi = transition_interface
+                    .get("returns")
+                    .ok_or_else(|| {
+                        WalletError::Custom(
+                            "interface transition must contain 'returns'".to_string(),
+                        )
+                    })?
+                    .as_array()
+                    .ok_or_else(|| {
+                        WalletError::Custom("'returns' must be a JSON array".to_string())
+                    })?;
+                let main_assignment_type = main_assignment_type_from_returns_abi(
+                    abi.as_slice(),
+                    default_assignment_type,
+                )
+                .map_err(|e| WalletError::Custom(e.to_string()))?;
+
                 let mut main_builder = wallet
                     .stock()
                     .transition_builder_raw(*contract_id, transition_type)
                     .map_err(|e| e.to_string())?;
 
                 let mut sum_inputs = Amount::ZERO;
+                let mut input_type_counts: std::collections::BTreeMap<rgb::AssignmentType, u16> =
+                    std::collections::BTreeMap::new();
                 for (_output, list) in wallet
                     .stock()
                     .contract_assignments_for(*contract_id, prev_outputs.iter().copied())
@@ -1076,17 +1095,32 @@ impl Exec for RgbArgs {
                 {
                     for (opout, state) in list {
                         main_builder = main_builder.add_input(opout, state.clone())?;
-                        match state {
-                            AllocatedState::Amount(value) => {
-                                sum_inputs += Amount::from(value);
-                            }
-                            _ => {
-                                let seal = create_change_output_seal(opout.ty, &meta)
-                                    .map_err(|e| e.to_string())?;
-                                main_builder =
-                                    main_builder.add_owned_state_raw(opout.ty, seal, state)?;
-                            }
+                        *input_type_counts.entry(opout.ty).or_insert(0) += 1;
+                        if opout.ty != main_assignment_type {
+                            let seal = create_change_output_seal(opout.ty, &meta)
+                                .map_err(|e| e.to_string())?;
+                            main_builder =
+                                main_builder.add_owned_state_raw(opout.ty, seal, state)?;
+                        } else if let AllocatedState::Amount(value) = state {
+                            sum_inputs += Amount::from(value);
+                        } else {
+                            let seal = create_change_output_seal(opout.ty, &meta)
+                                .map_err(|e| e.to_string())?;
+                            main_builder =
+                                main_builder.add_owned_state_raw(opout.ty, seal, state)?;
                         }
+                    }
+                }
+                for (type_id, occ) in &transition_details.transition_schema.inputs {
+                    let found = input_type_counts.get(type_id).copied().unwrap_or(0);
+                    if let Err(mismatch) = occ.check(found) {
+                        return Err(WalletError::Custom(format!(
+                            "insufficient transition inputs for type {}: required min={}, max={}, found={}",
+                            u16::from(*type_id),
+                            mismatch.min,
+                            mismatch.max,
+                            mismatch.found
+                        )));
                     }
                 }
 
@@ -1105,20 +1139,8 @@ impl Exec for RgbArgs {
                     run_script(&export, bl_validator.lib, bl_validator.pos, script_params)
                         .map_err(|e| e.to_string())?;
 
-                let abi = transition_interface
-                    .get("returns")
-                    .ok_or_else(|| {
-                        WalletError::Custom(
-                            "interface transition must contain 'returns'".to_string(),
-                        )
-                    })?
-                    .as_array()
-                    .ok_or_else(|| {
-                        WalletError::Custom("'returns' must be a JSON array".to_string())
-                    })?;
-
                 let change_seal =
-                    create_change_output_seal(default_assignment_type, &meta)
+                    create_change_output_seal(main_assignment_type, &meta)
                         .map_err(|e| e.to_string())?;
                 let ben_seal = beneficiary_seal.as_ref().unwrap_or(&change_seal);
                 main_builder = add_transition_states(
@@ -1131,6 +1153,7 @@ impl Exec for RgbArgs {
                 .map_err(|e| e.to_string())?;
 
                 let transition = main_builder.complete_transition()?;
+println!("transition: {:#?}", transition);
 
                 let extras =
                     build_extra_transitions(wallet.stock(), *contract_id, &prev_outputs, &meta)
@@ -1199,16 +1222,32 @@ impl Exec for RgbArgs {
                     .consume_fascia(fascia, FasciaResolver { witness_id })
                     .map_err(|e| e.to_string())?;
 
-                let beneficiary_outputs = if let Some(vout) = meta.beneficiary_vout {
-                    vec![OutputSeal::new(Outpoint::new(witness_id, vout))]
-                } else {
-                    vec![]
+                // `Stock::transfer` seeds opids via `opouts_by_outputs` (and secret seal terminals).
+                // The mem index does not fill `public_opouts`, so seeds must list every witness
+                // output that may own the new transition's state (beneficiary and/or change).
+                let mut transfer_output_seals: Vec<OutputSeal> = Vec::new();
+                let mut push_seal = |vout: u32| {
+                    let seal = OutputSeal::new(Outpoint::new(witness_id, vout));
+                    if !transfer_output_seals.contains(&seal) {
+                        transfer_output_seals.push(seal);
+                    }
                 };
+                if let Some(vout) = meta.beneficiary_vout {
+                    push_seal(vout);
+                }
+                if let Some(vout) = meta.change_vout {
+                    push_seal(vout);
+                }
+                if transfer_output_seals.is_empty() {
+                    return Err(WalletError::Custom(
+                        "cannot build transfer consignment: missing beneficiary_vout and change_vout for witness RGB outputs".into(),
+                    ));
+                }
                 let transfer = wallet
                     .stock()
                     .transfer(
                         *contract_id,
-                        beneficiary_outputs,
+                        transfer_output_seals,
                         vec![],
                         [],
                         Some(witness_id),
@@ -1381,13 +1420,13 @@ impl Exec for RgbArgs {
                 eprintln!("Dump is successfully generated and saved to '{root_dir}'");
             }
             Command::Validate { file } => {
-                let stock = self.rgb_stock()?;
+                self.rgb_stock()?;
                 let mut resolver = self.resolver()?;
                 let consignment = Transfer::load_file(file)?;
                 resolver.add_consignment_txes(&consignment);
                 let validation_config = ValidationConfig {
                     chain_net: self.chain_net(),
-                    trusted_typesystem: stock.as_stash_provider().type_system()?.clone(),
+                    trusted_typesystem: consignment.types.clone(),
                     ..Default::default()
                 };
                 let validated_consignment = consignment.validate(&resolver, &validation_config)?;
@@ -1406,7 +1445,7 @@ impl Exec for RgbArgs {
                 resolver.add_consignment_txes(&transfer);
                 let validation_config = ValidationConfig {
                     chain_net: self.chain_net(),
-                    trusted_typesystem: stock.as_stash_provider().type_system()?.clone(),
+                    trusted_typesystem: transfer.types.clone(),
                     ..Default::default()
                 };
                 let valid = transfer.validate(&resolver, &validation_config)?;

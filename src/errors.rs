@@ -75,6 +75,7 @@ pub enum WalletError {
     WalletUnknown(Ident),
 
     #[from]
+    #[display("RGB validation error: {_0:?}")]
     InvalidConsignment(ValidationError),
 
     /// invalid identifier.
