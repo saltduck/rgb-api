@@ -56,6 +56,21 @@ use strict_types::{FieldName, StrictVal};
 
 use crate::RgbArgs;
 
+fn parse_key_val<T, U>(
+    s: &str,
+) -> Result<(T, U), Box<dyn std::error::Error + Send + Sync + 'static>>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+    U: std::str::FromStr,
+    U::Err: std::error::Error + Send + Sync + 'static,
+{
+    let pos = s
+        .find('=')
+        .ok_or_else(|| format!("invalid KEY=value: no `=` found in `{s}`"))?;
+    Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
+}
+
 #[derive(Subcommand, Clone, PartialEq, Eq, Debug, Display)]
 #[display(lowercase)]
 #[allow(clippy::large_enum_variant)]
@@ -231,6 +246,45 @@ pub enum Command {
 
         /// Invoice data
         invoice: RgbInvoice,
+
+        /// Fee for bitcoin transaction, in satoshis
+        #[arg(short, long, default_value = "400")]
+        fee: u64,
+
+        /// File for generated transfer consignment
+        consignment: PathBuf,
+
+        /// Name of PSBT file to save. If not given, prints PSBT to STDOUT
+        psbt: Option<PathBuf>,
+    },
+
+    /// Execute a named RGB contract transition
+    #[display("transit")]
+    Transit {
+        /// Encode PSBT as V2
+        #[arg(short = '2')]
+        v2: bool,
+
+        /// Amount of satoshis which should be paid to the address-based
+        /// beneficiary
+        #[arg(long, default_value = "2000")]
+        sats: u64,
+
+        /// Contract identifier
+        contract_id: ContractId,
+
+        /// Transition name as defined in the contract schema
+        transition_name: String,
+
+        /// Arguments as key=value pairs, interpreted per the contract interface
+        #[arg(short, long = "arg", value_parser = parse_key_val::<String, String>)]
+        args: Vec<(String, String)>,
+
+        /// Beneficiary bitcoin address. If provided, an output is created for
+        /// this address in the PSBT and the script's "benifery" return is
+        /// assigned to it.
+        #[arg(short, long)]
+        beneficiary: Option<String>,
 
         /// Fee for bitcoin transaction, in satoshis
         #[arg(short, long, default_value = "400")]
@@ -854,6 +908,312 @@ impl Exec for RgbArgs {
                 let (mut psbt, _, transfer) = wallet
                     .pay::<PropKey, Output>(invoice, params)
                     .map_err(|err| err.to_string())?;
+
+                transfer.save_file(out_file)?;
+
+                psbt.version = if *v2 { PsbtVer::V2 } else { PsbtVer::V0 };
+                match psbt_file {
+                    Some(file_name) => {
+                        let mut psbt_file = File::create(file_name)?;
+                        psbt.encode(psbt.version, &mut psbt_file)?;
+                    }
+                    None => println!("{psbt}"),
+                }
+            }
+            Command::Transit {
+                v2,
+                contract_id,
+                transition_name,
+                args,
+                beneficiary,
+                fee,
+                sats,
+                psbt: psbt_file,
+                consignment: out_file,
+            } => {
+                use std::collections::HashMap;
+
+                use psrgbt::{RgbOutExt, RgbPsbtExt};
+                use rgb::containers::Batch;
+                use rgb::contract::AllocatedState;
+                use rgb::invoice::Amount;
+                use rgb::pay::{build_extra_transitions, create_change_output_seal};
+                use rgb::scripts::{
+                    add_transition_states, generate_transition_parameters_from_args, get_interface,
+                    run_script,
+                };
+                use rgb::validation::WitnessOrdProvider;
+                use rgb::vm::WitnessOrd;
+                use rgb::{TransitionType, WalletProvider as _};
+
+                let mut wallet = self.rgb_wallet(&config)?;
+                let params = TransferParams::with(*fee, *sats);
+
+                let export = wallet
+                    .stock()
+                    .export_contract(*contract_id)
+                    .map_err(|e| e.to_string())?;
+                let interface = get_interface(&export).map_err(|e| e.to_string())?;
+
+                let (&transition_type, _) = export
+                    .schema
+                    .transitions
+                    .iter()
+                    .find(|(_, d)| d.name.to_string() == *transition_name)
+                    .ok_or_else(|| {
+                        WalletError::Custom(format!(
+                            "transition '{}' not found in schema",
+                            transition_name
+                        ))
+                    })?;
+
+                let transition_interface =
+                    interface.get(transition_name.as_str()).ok_or_else(|| {
+                        WalletError::Custom(format!(
+                            "interface JSON does not contain '{}'",
+                            transition_name
+                        ))
+                    })?;
+
+                let bz_transition_type =
+                    TransitionType::with(u16::from(transition_type) + 0x8000u16);
+                let bl_transition_details = export
+                    .schema
+                    .transitions
+                    .get(&bz_transition_type)
+                    .ok_or_else(|| {
+                        WalletError::Custom(format!(
+                            "bizlogic transition 0x{:04x} not found in schema",
+                            u16::from(bz_transition_type)
+                        ))
+                    })?;
+
+                let bl_validator = bl_transition_details
+                    .transition_schema
+                    .validator
+                    .ok_or_else(|| {
+                        WalletError::Custom(
+                            "bizlogic transition has no validator script".to_string(),
+                        )
+                    })?;
+
+                let close_method = wallet.wallet().close_method();
+
+                let (prev_outputs, default_assignment_type) = {
+                    let filter = wallet.wallet().filter_unspent();
+                    let contract = wallet
+                        .stock()
+                        .contract_data(*contract_id)
+                        .map_err(|e| e.to_string())?;
+
+                    let default_at = *contract
+                        .schema
+                        .default_assignment
+                        .as_ref()
+                        .unwrap_or(contract.schema.owned_types.keys().next().unwrap());
+
+                    let mut prev_outputs = std::collections::BTreeSet::new();
+                    for details in contract.schema.owned_types.values() {
+                        if let Ok(allocs) = contract.fungible(details.name.clone(), &filter) {
+                            for a in allocs {
+                                prev_outputs.insert(a.seal);
+                            }
+                        }
+                        if let Ok(allocs) = contract.data(details.name.clone(), &filter) {
+                            for a in allocs {
+                                prev_outputs.insert(a.seal);
+                            }
+                        }
+                        if let Ok(allocs) = contract.rights(details.name.clone(), &filter) {
+                            for a in allocs {
+                                prev_outputs.insert(a.seal);
+                            }
+                        }
+                    }
+                    (prev_outputs, default_at)
+                };
+
+                if prev_outputs.is_empty() {
+                    return Err(WalletError::Custom(
+                        "no unspent state found for this contract".to_string(),
+                    ));
+                }
+
+                let prev_outpoints = prev_outputs
+                    .iter()
+                    .map(|o| Outpoint::new(o.txid, o.vout.to_u32()));
+
+                let (mut psbt, meta) = if let Some(addr) = beneficiary {
+                    wallet
+                        .wallet_mut()
+                        .create_psbt_with_address(addr, close_method, prev_outpoints, params)
+                        .map_err(|e| e.to_string())?
+                } else {
+                    wallet
+                        .wallet_mut()
+                        .create_psbt_no_beneficiary(close_method, prev_outpoints, params)
+                        .map_err(|e| e.to_string())?
+                };
+
+                let beneficiary_seal = meta.beneficiary_vout.map(|vout| {
+                    use rgb::rgbcore::secp256k1::rand;
+                    rgb::containers::BuilderSeal::Revealed(GraphSeal::with_blinded_vout(
+                        vout,
+                        rand::random(),
+                    ))
+                });
+
+                let mut main_builder = wallet
+                    .stock()
+                    .transition_builder_raw(*contract_id, transition_type)
+                    .map_err(|e| e.to_string())?;
+
+                let mut sum_inputs = Amount::ZERO;
+                for (_output, list) in wallet
+                    .stock()
+                    .contract_assignments_for(*contract_id, prev_outputs.iter().copied())
+                    .map_err(|e| e.to_string())?
+                {
+                    for (opout, state) in list {
+                        main_builder = main_builder.add_input(opout, state.clone())?;
+                        match state {
+                            AllocatedState::Amount(value) => {
+                                sum_inputs += Amount::from(value);
+                            }
+                            _ => {
+                                let seal = create_change_output_seal(opout.ty, &meta)
+                                    .map_err(|e| e.to_string())?;
+                                main_builder =
+                                    main_builder.add_owned_state_raw(opout.ty, seal, state)?;
+                            }
+                        }
+                    }
+                }
+
+                let args_map: HashMap<String, String> = args.iter().cloned().collect();
+
+                let parameters = transition_interface.get("parameters").ok_or_else(|| {
+                    WalletError::Custom(
+                        "interface transition must contain 'parameters'".to_string(),
+                    )
+                })?;
+                let script_params =
+                    generate_transition_parameters_from_args(parameters, &args_map, sum_inputs)
+                        .map_err(|e| e.to_string())?;
+
+                let outputs =
+                    run_script(&export, bl_validator.lib, bl_validator.pos, script_params)
+                        .map_err(|e| e.to_string())?;
+
+                let abi = transition_interface
+                    .get("returns")
+                    .ok_or_else(|| {
+                        WalletError::Custom(
+                            "interface transition must contain 'returns'".to_string(),
+                        )
+                    })?
+                    .as_array()
+                    .ok_or_else(|| {
+                        WalletError::Custom("'returns' must be a JSON array".to_string())
+                    })?;
+
+                let change_seal =
+                    create_change_output_seal(default_assignment_type, &meta)
+                        .map_err(|e| e.to_string())?;
+                let ben_seal = beneficiary_seal.as_ref().unwrap_or(&change_seal);
+                main_builder = add_transition_states(
+                    abi,
+                    &outputs,
+                    main_builder,
+                    ben_seal,
+                    &change_seal,
+                )
+                .map_err(|e| e.to_string())?;
+
+                let transition = main_builder.complete_transition()?;
+
+                let extras =
+                    build_extra_transitions(wallet.stock(), *contract_id, &prev_outputs, &meta)
+                        .map_err(|e| e.to_string())?;
+
+                let mut batch = Batch {
+                    main: transition,
+                    extras,
+                };
+                batch.set_priority(u64::MAX);
+
+                psbt.set_rgb_close_method(close_method);
+                psbt.set_as_unmodifiable();
+                psbt.rgb_embed(batch).map_err(|e| e.to_string())?;
+
+                let fascia = psbt.rgb_commit().map_err(|e| e.to_string())?;
+                {
+                    use rgb::rgbcore::dbc::tapret::TapretProof;
+                    use rgb::rgbcore::dbc::Proof as _;
+                    if matches!(
+                        fascia.seal_witness().dbc_proof.method(),
+                        rgb::rgbcore::seals::txout::CloseMethod::TapretFirst
+                    ) {
+                        if psbt.rgb_tapret_host_on_change() {
+                            let output = psbt
+                                .dbc_output::<TapretProof>()
+                                .ok_or_else(|| {
+                                    WalletError::Custom(
+                                        "no taproot output for tapret".to_string(),
+                                    )
+                                })?;
+                            let terminal: psrgbt::Terminal = output
+                                .terminal_derivation()
+                                .ok_or_else(|| {
+                                    WalletError::Custom("inconclusive derivation".to_string())
+                                })?
+                                .into();
+                            let tapret_commitment = output
+                                .tapret_commitment()
+                                .map_err(|e| WalletError::Custom(e.to_string()))?;
+                            wallet
+                                .wallet_mut()
+                                .add_tapret_tweak(terminal, tapret_commitment)
+                                .map_err(|e| WalletError::Custom(e.to_string()))?;
+                        }
+                    }
+                }
+
+                let witness_id = psbt.get_txid();
+
+                struct FasciaResolver {
+                    witness_id: rgb::Txid,
+                }
+                impl WitnessOrdProvider for FasciaResolver {
+                    fn witness_ord(
+                        &self,
+                        witness_id: rgb::Txid,
+                    ) -> Result<WitnessOrd, rgb::validation::WitnessResolverError> {
+                        assert_eq!(witness_id, self.witness_id);
+                        Ok(WitnessOrd::Tentative)
+                    }
+                }
+
+                wallet
+                    .stock_mut()
+                    .consume_fascia(fascia, FasciaResolver { witness_id })
+                    .map_err(|e| e.to_string())?;
+
+                let beneficiary_outputs = if let Some(vout) = meta.beneficiary_vout {
+                    vec![OutputSeal::new(Outpoint::new(witness_id, vout))]
+                } else {
+                    vec![]
+                };
+                let transfer = wallet
+                    .stock()
+                    .transfer(
+                        *contract_id,
+                        beneficiary_outputs,
+                        vec![],
+                        [],
+                        Some(witness_id),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 transfer.save_file(out_file)?;
 

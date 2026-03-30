@@ -5,54 +5,92 @@
 
 
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
+use std::rc::Rc;
 
+use aluvm::data::{ByteStr, Number};
 use aluvm::library::{LibId, LibSite};
-use aluvm::reg::{Reg32, Reg16, Reg8};
+use aluvm::reg::{Reg8, Reg16, Reg32, RegAFR, RegR, RegS};
 // use aluvm::reg::CoreRegs;
-use amplify::confinement::{Confined, U24};
+use amplify::confinement::{Confined, TinyBlob, U24};
+use amplify::hex::FromHex;
 use amplify::num::u5;
 use chrono::Utc;
-use psrgbt::{RgbOutExt, RgbPropKeyExt, RgbPsbtExt, TapretKeyError, Terminal};
 use rgbstd::bitcoin::hashes::sha256d;
 use rgbstd::containers::{Batch, BuilderSeal, Transfer};
-use rgbstd::contract::{AllocatedState, AssignmentsFilter, BuilderError, TransitionBuilder};
+use rgbstd::contract::TransitionBuilder;
 use rgbstd::invoice::{Amount, Beneficiary, InvoiceState, RgbInvoice};
 use rgbstd::persistence::{IndexProvider, StashInconsistency, StashProvider, StateProvider, Stock};
 use rgbstd::rgbcore::dbc::tapret::{TapretCommitment, TapretProof};
 use rgbstd::rgbcore::dbc::Proof;
-use rgbstd::rgbcore::seals::txout::{CloseMethod, ExplicitSeal};
 use rgbstd::rgbcore::secp256k1::rand;
 use rgbstd::validation::WitnessOrdProvider;
-use rgbstd::containers::Consignment;
+use rgbstd::containers::{Consignment, ConsignmentExt};
+use rgbstd::vm::{ContractStateAccess, ContractStateEvolve, OrdOpRef, RgbIsa};
 use rgbstd::{
-    AssignmentType, ContractId, GraphSeal, Opout, Outpoint, OutputSeal, RevealedData, RevealedState, Transition, TransitionType, Txid
+    AssignmentType, ContractId, GraphSeal, OpId, Operation, Opout, Outpoint, OutputSeal, RevealedData,
+    RevealedState, Transition, TransitionType, Txid,
 };
 use {
     aluvm::Vm,
-    aluvm::isa::{Instr, OutrValue},
+    aluvm::isa::{Instr, InstructionSet, OutrValue},
 };
-// use rgbstd::vm::{OrdOpRef};
-// use rgbstd::vm::contract::{VmContext, OpInfo};
 use rgbstd::Vout; // 或你本地的 vout 类型
 
 use crate::filters::{Filter, WalletFilter};
-use crate::invoice::NonFungible;
 use crate::validation::WitnessResolverError;
 use crate::vm::WitnessOrd;
 use crate::{CompletionError, CompositionError, PayError, WalletError};
 
 #[derive(Debug, Clone)]
-pub(crate) struct ScriptParam {
+pub struct ScriptParam {
     pub reg_name: String,
     pub idx: u8,
     pub value: String,
 }
 
-pub fn run_script(consignment: &Consignment<false>, lib_id: LibId, pos: u16, params: Vec<ScriptParam>) -> Result<Vec<OutrValue>, CompositionError> {
-    let mut vm = Vm::<Instr>::new();
+use rgbstd::schema::Schema;
+use rgbstd::persistence::{MemContract, MemContractState};
+
+/// Matches `rgbcore::vm::contract::OpInfo` layout (keep in sync with rgb-consensus).
+struct OpInfoWire<'op> {
+    id: OpId,
+    prev_state: &'op BTreeMap<AssignmentType, Vec<RevealedState>>,
+    op: &'op OrdOpRef<'op>,
+}
+
+/// Matches `rgbcore::vm::contract::VmContext` layout (keep in sync with rgb-consensus).
+struct VmContextWire<'op, S: ContractStateAccess> {
+    contract_id: ContractId,
+    op_info: OpInfoWire<'op>,
+    contract_state: Rc<RefCell<S>>,
+}
+
+/// `VmContext` is not public outside rgb-consensus; `InstructionSet::Context` is the same type.
+#[inline]
+fn wire_as_exec_ctx<'op, S: ContractStateAccess>(
+    wire: &'op VmContextWire<'op, S>,
+) -> &'op <Instr<RgbIsa<S>> as InstructionSet>::Context<'op> {
+    // SAFETY: `VmContextWire` / `OpInfoWire` mirror the private `VmContext` / `OpInfo` structs.
+    unsafe { std::mem::transmute(wire) }
+}
+
+pub fn run_script<const TRANSFER: bool>(
+    consignment: &Consignment<TRANSFER>,
+    lib_id: LibId,
+    pos: u16,
+    params: Vec<ScriptParam>,
+) -> Result<Vec<OutrValue>, CompositionError> {
+    type M = MemContract<MemContractState>;
+
+    let init_ctx = (&consignment.schema, consignment.contract_id());
+    let contract_state = Rc::new(RefCell::new(M::init(init_ctx)));
+
+    let mut vm = Vm::<Instr<RgbIsa<M>>>::new();
     vm.registers.set_outstack_limit(1024);
+
     for param in params {
         match param.reg_name.as_str() {
             "a64" => {
@@ -61,25 +99,52 @@ pub fn run_script(consignment: &Consignment<false>, lib_id: LibId, pos: u16, par
                     param.value.parse::<u64>().unwrap(),
                 );
             }
+            "r256" => {
+                let _ = vm.registers.set_n(
+                    RegAFR::R(RegR::R256),
+                    Reg32::from(u5::try_from(param.idx).unwrap()),
+                    Number::from_hex(&param.value).unwrap(),
+                );
+            }
+            "s16" => {
+                let _ = vm.registers.set_s16(
+                    RegS::from(u5::try_from(param.idx).unwrap()),
+                    ByteStr::from(ByteStr::with(param.value.as_bytes())),
+                );
+            }
             _ => {
-                return Err(CompositionError::Unexpected(
-                    format!("Invalid register name: {}", param.reg_name),
-                ));
+                return Err(CompositionError::Unexpected(format!(
+                    "Invalid register name: {}",
+                    param.reg_name
+                )));
             }
         }
     }
-    let scripts: BTreeMap<_, _> = 
-        consignment.scripts.clone().into_iter().map(|s| (s.id(), s.clone()))
-        .collect();
-    let ok = vm.exec(LibSite::with(pos, lib_id), |id| scripts.get(&id), &());
+
+    let scripts: BTreeMap<_, _> =
+        consignment.scripts.iter().map(|s| (s.id(), s.clone())).collect();
+
+    let prev_state = BTreeMap::new();
+    let ord_op = OrdOpRef::Genesis(consignment.genesis());
+    let wire = VmContextWire {
+        contract_id: consignment.contract_id(),
+        op_info: OpInfoWire {
+            id: ord_op.id(),
+            prev_state: &prev_state,
+            op: &ord_op,
+        },
+        contract_state: Rc::clone(&contract_state),
+    };
+    let exec_ctx = wire_as_exec_ctx(&wire);
+
+    let ok = vm.exec(LibSite::with(pos, lib_id), |id| scripts.get(&id), exec_ctx);
     if !ok {
-        return Err(CompositionError::Unexpected(
-            format!("script {}@{} failed to execute", pos, lib_id),
-        ));
+        return Err(CompositionError::Unexpected(format!(
+            "script {}@{} failed to execute",
+            pos, lib_id
+        )));
     }
-    let outputs = vm.registers.outstack().to_vec();
-    println!("outputs: {:?}", outputs);
-    Ok(outputs)
+    Ok(vm.registers.outstack().to_vec())
 }
 
 pub fn outr_value_to_str(outr_value: &OutrValue) -> Result<&str, CompositionError> {
@@ -138,6 +203,37 @@ pub fn base62_to_hash256(s: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+/// Owned-state semantic type ids (aligned with `rgb-schemas` `lib.rs`).
+const SEM_TYPE_OS_ASSET: u64 = 4000;
+const SEM_TYPE_OS_HASH: u64 = 4202;
+const SEM_TYPE_OS_OUTPOINT: u64 = 4014;
+
+fn json_number_to_semantic_id(n: &serde_json::Number) -> Option<u64> {
+    n.as_u64()
+        .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok()))
+        .or_else(|| {
+            let f = n.as_f64()?;
+            (f >= 0.0 && f.is_finite() && f.fract() == 0.0).then_some(f as u64)
+        })
+}
+
+fn json_string_to_semantic_id(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    t.parse::<u64>().ok()
+}
+
+/// Interface `"type"`: JSON number (incl. whole float) or decimal string.
+fn json_semantic_type_id(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Number(n) => json_number_to_semantic_id(n),
+        serde_json::Value::String(s) => json_string_to_semantic_id(s),
+        _ => None,
+    }
+}
+
 /// `inputs` 为 interface JSON 里的 `inputs` 数组；`sum_inputs` / `amt` 为本次支付侧已知金额。
 pub fn generate_transition_parameters(
     parameters: &serde_json::Value,
@@ -150,21 +246,18 @@ pub fn generate_transition_parameters(
         ));
     };
     let mut script_params = Vec::new();
-    let OS_ASSET: u64 = 4000;
     for input in rows {
-        let param_type = input
-            .get("type")
-            .and_then(|v| v.as_u64());
+        let param_type = input.get("type").and_then(json_semantic_type_id);
         let param_name = input.get("name").and_then(|v| v.as_str()).unwrap_or_default();
         match param_name {
-            "inputs" | "sum_inputs" if param_type == Some(OS_ASSET) => {
+            "inputs" | "sum_inputs" if param_type == Some(SEM_TYPE_OS_ASSET) => {
                 script_params.push(ScriptParam {
                     reg_name: "a64".to_string(),
                     idx: 0,
                     value: u64::from(sum_inputs).to_string(),
                 });
             }
-            "amount" | "amt" if param_type == Some(OS_ASSET) => {
+            "amount" | "amt" if param_type == Some(SEM_TYPE_OS_ASSET) => {
                 script_params.push(ScriptParam {
                     reg_name: "a64".to_string(),
                     idx: 1,
@@ -184,23 +277,116 @@ pub fn generate_transition_parameters(
     Ok(script_params)
 }
 
+pub fn generate_transition_parameters_from_args(
+    parameters: &serde_json::Value,
+    args: &std::collections::HashMap<String, String>,
+    sum_inputs: Amount,
+) -> Result<Vec<ScriptParam>, CompositionError> {
+    println!("parameters: {:?}", parameters);
+    println!("args: {:?}", args);
+    println!("sum_inputs: {:?}", sum_inputs);
+    let Some(rows) = parameters.as_array() else {
+        return Err(CompositionError::Unexpected(
+            "interface parameters must be a JSON array".to_string(),
+        ));
+    };
+    let mut script_params = Vec::new();
+    for (idx, param) in rows.iter().enumerate() {
+        let param_name = param
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let param_type = param
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let value = match param_name {
+            "inputs" | "sum_inputs" => u64::from(sum_inputs).to_string(),
+            other => args
+                .get(other)
+                .ok_or_else(|| {
+                    CompositionError::Unexpected(format!(
+                        "missing required arg '{}' for transition parameter",
+                        other
+                    ))
+                })?
+                .clone(),
+        };
+        script_params.push(ScriptParam {
+            reg_name: param_type.to_string(),
+            idx: idx as u8,
+            value,
+        });
+    }
+    Ok(script_params)
+}
+
 pub fn parse_amount(value: &OutrValue) -> Result<Amount, CompositionError> {
     match value {
         OutrValue::Int(v) if *v >= 0 => Ok(Amount::from(*v as u64)),
-        _ => Err(CompositionError::Unexpected(
-            "validator outstack values must be non-negative integers".to_string(),
-        )),
+        OutrValue::Int(v) => Err(CompositionError::Unexpected(format!(
+            "amount must be non-negative int (a64 / OUTR), got {v}"
+        ))),
+        other => Err(CompositionError::Unexpected(format!(
+            "amount must be a64 integer OUTR value, got {other:?} (use ABI type OS_HASH for sha256 Bytes)"
+        ))),
     }
 }
 
-pub fn get_interface(consignment: &Consignment<false>) -> Result<serde_json::Value, CompositionError> {
+/// Parses sha256 from AluVM outstack: **32 raw bytes**, or **64 hex digits** (optional `0x`), UTF-8.
+pub fn parse_hash256(value: &OutrValue) -> Result<[u8; 32], CompositionError> {
+    match value {
+        OutrValue::Bytes(b) => {
+            if b.len() == 32 {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(b.as_slice());
+                return Ok(a);
+            }
+            let s = std::str::from_utf8(b.as_slice()).map_err(|e| {
+                CompositionError::Unexpected(format!("OS_HASH: invalid utf-8 in outstack bytes: {e}"))
+            })?;
+            let t = s.trim();
+            let hex_body = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+            if hex_body.len() != 64 {
+                return Err(CompositionError::Unexpected(format!(
+                    "OS_HASH: expected 32 raw bytes or 64 hex chars, got {} bytes / {} hex chars",
+                    b.len(),
+                    hex_body.len()
+                )));
+            }
+            if !hex_body.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(CompositionError::Unexpected(
+                    "OS_HASH: hex digest must be 64 hex digits".to_string(),
+                ));
+            }
+            let mut out = [0u8; 32];
+            for i in 0..32 {
+                out[i] = u8::from_str_radix(&hex_body[2 * i..2 * i + 2], 16).map_err(|e| {
+                    CompositionError::Unexpected(format!("OS_HASH: invalid hex: {e}"))
+                })?;
+            }
+            Ok(out)
+        }
+        other => Err(CompositionError::Unexpected(format!(
+            "OS_HASH: expected Bytes (32 raw or 64-char hex), got {other:?}"
+        ))),
+    }
+}
+
+pub fn get_interface<const TRANSFER: bool>(
+    consignment: &Consignment<TRANSFER>,
+) -> Result<serde_json::Value, CompositionError> {
     let interface_transition = consignment.schema.transitions.get(&TransitionType::with(65535u16))
         .ok_or(CompositionError::Unexpected("interface transition not found".to_string()))?;
     let interface_name = interface_transition.name.to_string();
     let interface_libid = LibId::from(base62_to_hash256(&interface_name[9..])?);
     let interface_outr_values =
-        run_script(&consignment, interface_libid, 0, Vec::<ScriptParam>::new())
-        .map_err(|e| e.to_string())?;
+        run_script(
+            &consignment, 
+            interface_libid, 
+            0, 
+            Vec::<ScriptParam>::new()
+        ).map_err(|e| e.to_string())?;
     if interface_outr_values.len() != 1 {
         return Err(CompositionError::Unexpected(
             "interface outr values must provide only one value".to_string(),
@@ -222,10 +408,28 @@ pub fn add_transition_states(
     let mut stashed_seal: Option<BuilderSeal<GraphSeal>> = None;
     for (i, value) in abi.iter().enumerate() {
         let outr_value = &outputs[i];
-        let abi_name = value.get("name").and_then(|v| v.as_str()).unwrap();
-        let abi_type = AssignmentType::from(value.get("type").and_then(|v| v.as_u64()).unwrap() as u16);
+        let abi_name = value
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                CompositionError::Unexpected(format!(
+                    "ABI entry at index {i}: missing or non-string 'name'"
+                ))
+            })?;
+        let type_raw = value.get("type").and_then(json_semantic_type_id).ok_or_else(|| {
+            CompositionError::Unexpected(format!(
+                "ABI entry at index {i} (name={abi_name:?}): missing or invalid 'type' (expect integer, whole float, or decimal string)"
+            ))
+        })?;
+        let abi_type = AssignmentType::from(type_raw as u16);
+
         match abi_name {
             "benifery" => {
+                if type_raw != SEM_TYPE_OS_ASSET {
+                    return Err(CompositionError::Unexpected(format!(
+                        "ABI 'benifery' at index {i}: expected type {SEM_TYPE_OS_ASSET} (OS_ASSET), got {type_raw}"
+                    )));
+                }
                 let received = parse_amount(outr_value)?;
                 if received > Amount::ZERO {
                     main_builder = main_builder.add_fungible_state_raw(
@@ -234,18 +438,41 @@ pub fn add_transition_states(
                         received,
                     )?;
                 }
-            },
-            "change" => {
-                let change = parse_amount(outr_value)?;
-                if change > Amount::ZERO {
-                    main_builder = main_builder.add_fungible_state_raw(
+            }
+            "change" => match type_raw {
+                SEM_TYPE_OS_ASSET => {
+                    let change = parse_amount(outr_value)?;
+                    if change > Amount::ZERO {
+                        main_builder = main_builder.add_fungible_state_raw(
+                            abi_type,
+                            change_seal.clone(),
+                            change,
+                        )?;
+                    }
+                }
+                SEM_TYPE_OS_HASH => {
+                    let hash = parse_hash256(outr_value)?;
+                    let payload = Confined::try_from_iter(hash.iter().copied()).map_err(|e| {
+                        CompositionError::Unexpected(format!("OS_HASH RevealedData: {e}"))
+                    })?;
+                    main_builder = main_builder.add_data_raw(
                         abi_type,
                         change_seal.clone(),
-                        change,
+                        RevealedData::new(payload),
                     )?;
+                }
+                other => {
+                    return Err(CompositionError::Unexpected(format!(
+                        "ABI 'change' at index {i}: unsupported type {other} (expected {SEM_TYPE_OS_ASSET} OS_ASSET or {SEM_TYPE_OS_HASH} OS_HASH)"
+                    )));
                 }
             },
             "owner" => {
+                if type_raw != SEM_TYPE_OS_OUTPOINT {
+                    return Err(CompositionError::Unexpected(format!(
+                        "ABI 'owner' at index {i}: expected type {SEM_TYPE_OS_OUTPOINT} (OS_OUTPOINT), got {type_raw}"
+                    )));
+                }
                 // 解析state的格式为"txid:vout"，其后必须跟一个state值，然后一同添加到main_builder中
                 let s = match outr_value {
                     OutrValue::Bytes(v) => std::str::from_utf8(v.as_slice())
@@ -257,8 +484,7 @@ pub fn add_transition_states(
                         })?,
                     _ => {
                         return Err(CompositionError::Unexpected(
-                            "state must be bytes encoded as 'txid:vout'"
-                                .to_string(),
+                            "state must be bytes encoded as 'txid:vout'".to_string(),
                         ));
                     }
                 };
@@ -282,8 +508,13 @@ pub fn add_transition_states(
                 })?;
                 let outpoint = Outpoint::new(txid, vout);
                 stashed_seal = Some(BuilderSeal::Revealed(GraphSeal::rand_from(outpoint)));
-            },
+            }
             "amount" => {
+                if type_raw != SEM_TYPE_OS_ASSET {
+                    return Err(CompositionError::Unexpected(format!(
+                        "ABI 'amount' at index {i}: expected type {SEM_TYPE_OS_ASSET} (OS_ASSET), got {type_raw}"
+                    )));
+                }
                 let local_stashed_seal = stashed_seal.ok_or_else(|| {
                     CompositionError::Unexpected(
                         "state 'amount' encountered before 'owner'".to_string(),
@@ -296,10 +527,13 @@ pub fn add_transition_states(
                     amount,
                 )?;
                 stashed_seal = None;
-        },
-            _ => return Err(CompositionError::Unexpected(
-                "state must be in the format of txid:vout:amount".to_string(),
-            )),
+            }
+            _ => {
+                return Err(CompositionError::Unexpected(format!(
+                    "unknown ABI name {:?} at index {i}",
+                    abi_name
+                )));
+            }
         }
     }
     Ok(main_builder)

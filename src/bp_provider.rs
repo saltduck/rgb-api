@@ -27,8 +27,9 @@ use bpwallet::psbt::{
 };
 use bpwallet::{Address, IdxBase, LockTime, NormalIndex, Psbt as BpPsbt, Sats, SeqNo, Wallet};
 use psrgbt::bp_conversion_utils::{
-    address_network_bitcoin_to_bp, address_payload_bp_from_script_pubkey, outpoint_bitcoin_to_bp,
-    script_buf_to_script_pubkey, txid_bitcoin_to_bp, untweakedpublickey_to_internal_pk,
+    address_bitcoin_to_bp, address_network_bitcoin_to_bp, address_payload_bp_from_script_pubkey,
+    outpoint_bitcoin_to_bp, script_buf_to_script_pubkey, txid_bitcoin_to_bp,
+    untweakedpublickey_to_internal_pk,
 };
 use psrgbt::{RgbOutExt, RgbPsbtExt, Terminal};
 use rgbstd::containers::Transfer;
@@ -246,6 +247,137 @@ impl<K, D: DescriptorRgb + bpwallet::Descriptor<K>> WalletProvider for Wallet<K,
             }
             Beneficiary::BlindedSeal(_) => None,
         };
+
+        let mut meta: PsbtMeta = meta.into();
+        meta.beneficiary_vout = beneficiary_vout.map(|v| v.into_u32());
+
+        Ok((psbt, meta))
+    }
+
+    fn create_psbt_no_beneficiary(
+        &mut self,
+        close_method: CloseMethod,
+        prev_outpoints: impl IntoIterator<Item = Outpoint>,
+        params: TransferParams,
+    ) -> Result<(Self::Psbt, PsbtMeta), CompositionError> {
+        let prev_outpoints = prev_outpoints
+            .into_iter()
+            .map(outpoint_bitcoin_to_bp)
+            .collect::<Vec<_>>();
+
+        let bp_tx_params: BpTxParams = params.tx.into();
+        let (mut psbt, mut meta) =
+            self.construct_psbt(prev_outpoints, &[], bp_tx_params)?;
+
+        let change_script = meta
+            .change_vout
+            .and_then(|vout| psbt.output(vout.to_usize()))
+            .map(|output| output.script.clone());
+
+        match close_method {
+            CloseMethod::TapretFirst => {
+                let tap_out_script = change_script
+                    .clone()
+                    .ok_or(CompositionError::NoOutputForTapretCommitment)?;
+                psbt.set_rgb_tapret_host_on_change();
+                psbt.outputs_mut()
+                    .find(|o| o.script.is_p2tr() && o.script == tap_out_script)
+                    .map(|o| o.set_tapret_host());
+                psbt.sort_outputs_by(|output| !output.is_tapret_host())
+                    .expect("PSBT must be modifiable at this stage");
+            }
+            CloseMethod::OpretFirst => {
+                psbt.set_opret_host();
+                psbt.sort_outputs_by(|output| !output.is_opret_host())
+                    .expect("PSBT must be modifiable at this stage");
+            }
+        }
+
+        if let Some(ref change_script) = change_script {
+            for output in psbt.outputs() {
+                if output.script == *change_script {
+                    meta.change_vout = Some(output.vout());
+                    break;
+                }
+            }
+        }
+
+        let meta: PsbtMeta = meta.into();
+        Ok((psbt, meta))
+    }
+
+    fn create_psbt_with_address(
+        &mut self,
+        beneficiary_address: &str,
+        close_method: CloseMethod,
+        prev_outpoints: impl IntoIterator<Item = Outpoint>,
+        params: TransferParams,
+    ) -> Result<(Self::Psbt, PsbtMeta), CompositionError> {
+        use std::str::FromStr;
+
+        use rgbstd::bitcoin;
+
+        let bitcoin_addr = bitcoin::Address::from_str(beneficiary_address)
+            .map_err(|e| CompositionError::Unexpected(format!("invalid address: {e}")))?
+            .assume_checked();
+        let bp_addr = address_bitcoin_to_bp(bitcoin_addr);
+        let bp_beneficiary = BpBeneficiary::new(bp_addr, Sats::from_sats(params.min_amount));
+
+        let beneficiary_script = {
+            let bitcoin_addr2 = bitcoin::Address::from_str(beneficiary_address)
+                .unwrap()
+                .assume_checked();
+            script_buf_to_script_pubkey(bitcoin_addr2.script_pubkey())
+        };
+
+        let prev_outpoints = prev_outpoints
+            .into_iter()
+            .map(outpoint_bitcoin_to_bp)
+            .collect::<Vec<_>>();
+
+        let bp_tx_params: BpTxParams = params.tx.into();
+        let (mut psbt, mut meta) =
+            self.construct_psbt(prev_outpoints, &[bp_beneficiary], bp_tx_params)?;
+
+        let change_script = meta
+            .change_vout
+            .and_then(|vout| psbt.output(vout.to_usize()))
+            .map(|output| output.script.clone());
+
+        match close_method {
+            CloseMethod::TapretFirst => {
+                let tap_out_script = if let Some(change_script) = change_script.clone() {
+                    psbt.set_rgb_tapret_host_on_change();
+                    change_script
+                } else {
+                    return Err(CompositionError::NoOutputForTapretCommitment);
+                };
+                psbt.outputs_mut()
+                    .find(|o| o.script.is_p2tr() && o.script == tap_out_script)
+                    .map(|o| o.set_tapret_host());
+                psbt.sort_outputs_by(|output| !output.is_tapret_host())
+                    .expect("PSBT must be modifiable at this stage");
+            }
+            CloseMethod::OpretFirst => {
+                psbt.set_opret_host();
+                psbt.sort_outputs_by(|output| !output.is_opret_host())
+                    .expect("PSBT must be modifiable at this stage");
+            }
+        }
+
+        if let Some(ref change_script) = change_script {
+            for output in psbt.outputs() {
+                if output.script == *change_script {
+                    meta.change_vout = Some(output.vout());
+                    break;
+                }
+            }
+        }
+
+        let beneficiary_vout = psbt
+            .outputs()
+            .find(|output| output.script == beneficiary_script)
+            .map(|o| o.vout());
 
         let mut meta: PsbtMeta = meta.into();
         meta.beneficiary_vout = beneficiary_vout.map(|v| v.into_u32());

@@ -436,7 +436,7 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
 }
 
 #[allow(clippy::result_large_err)]
-fn create_change_output_seal(
+pub fn create_change_output_seal(
     assignment_type: AssignmentType,
     meta: &PsbtMeta,
 ) -> Result<BuilderSeal<GraphSeal>, CompositionError> {
@@ -448,7 +448,7 @@ fn create_change_output_seal(
 }
 
 #[allow(clippy::result_large_err)]
-fn build_extra_transitions<S: StashProvider, H: StateProvider, I: IndexProvider>(
+pub fn build_extra_transitions<S: StashProvider, H: StateProvider, I: IndexProvider>(
     stock: &Stock<S, H, I>,
     contract_id: ContractId,
     prev_outputs: &BTreeSet<OutputSeal>,
@@ -580,6 +580,23 @@ pub trait WalletProvider {
         invoice: &RgbInvoice,
         close_method: CloseMethod,
         coins: impl IntoIterator<Item = Outpoint>,
+        params: TransferParams,
+    ) -> Result<(Self::Psbt, PsbtMeta), CompositionError>;
+
+    #[allow(clippy::result_large_err)]
+    fn create_psbt_no_beneficiary(
+        &mut self,
+        close_method: CloseMethod,
+        prev_outpoints: impl IntoIterator<Item = Outpoint>,
+        params: TransferParams,
+    ) -> Result<(Self::Psbt, PsbtMeta), CompositionError>;
+
+    #[allow(clippy::result_large_err)]
+    fn create_psbt_with_address(
+        &mut self,
+        beneficiary_address: &str,
+        close_method: CloseMethod,
+        prev_outpoints: impl IntoIterator<Item = Outpoint>,
         params: TransferParams,
     ) -> Result<(Self::Psbt, PsbtMeta), CompositionError>;
 

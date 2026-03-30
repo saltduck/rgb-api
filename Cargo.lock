@@ -1886,7 +1886,7 @@ dependencies = [
 [[package]]
 name = "rgb-consensus"
 version = "0.11.1-rc.8"
-source = "git+https://github.com/saltduck/rgb-consensus?branch=outstack#7596637672dfa9c59dad52a82c0ca480d7125d19"
+source = "git+https://github.com/saltduck/rgb-consensus?branch=outstack#90def50f79a34d12c1f9ef9088c1a5028688d009"
 dependencies = [
  "amplify",
  "baid64",

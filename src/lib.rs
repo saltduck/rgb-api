@@ -34,13 +34,13 @@ mod filters;
 pub mod pay;
 mod errors;
 mod wallet;
-mod scripts;
+pub mod scripts;
 
 #[cfg(feature = "bp")]
 pub use descriptor::bp_wallet_integration;
 pub use descriptor::{DescriptorRgb, RgbDescr, TapretKey, WpkhDescr};
 pub use errors::{CompletionError, CompositionError, PayError, WalletError};
-pub use pay::{TransferParams, WalletProvider};
+pub use pay::{PsbtMeta, TransferParams, WalletProvider, build_extra_transitions, create_change_output_seal};
 pub use rgbstd::*;
 pub mod resolvers {
     pub use rgbstd::indexers::AnyResolver;
