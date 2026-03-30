@@ -91,7 +91,6 @@ pub fn run_script<const TRANSFER: bool>(
 
     let mut vm = Vm::<Instr<RgbIsa<M>>>::new();
     vm.registers.set_outstack_limit(1024);
-println!("params: {:?}", params);
     for param in params {
         match param.reg_name.as_str() {
             "a64" => {
@@ -122,12 +121,8 @@ println!("params: {:?}", params);
         }
     }
 
-println!("run_script: {:?}", consignment.scripts);
     let scripts: BTreeMap<_, _> =
         consignment.scripts.iter().map(|s| (s.id(), s.clone())).collect();
-println!("scripts: {:?}", scripts);
-println!("lib_id: {:?}", lib_id);
-println!("pos: {:?}", pos);
     let prev_state = BTreeMap::new();
     let ord_op = OrdOpRef::Genesis(consignment.genesis());
     let wire = VmContextWire {
@@ -306,9 +301,6 @@ pub fn generate_transition_parameters_from_args(
     args: &std::collections::HashMap<String, String>,
     sum_inputs: Amount,
 ) -> Result<Vec<ScriptParam>, CompositionError> {
-    println!("parameters: {:?}", parameters);
-    println!("args: {:?}", args);
-    println!("sum_inputs: {:?}", sum_inputs);
     let Some(rows) = parameters.as_array() else {
         return Err(CompositionError::Unexpected(
             "interface parameters must be a JSON array".to_string(),
@@ -366,7 +358,7 @@ pub fn parse_string(value: &OutrValue) -> Result<Vec<u8>, CompositionError> {
     }
 }
 
-fn parse_outpoint_payload(value: &OutrValue) -> Result<Vec<u8>, CompositionError> {
+fn parse_outpoint(value: &OutrValue) -> Result<Outpoint, CompositionError> {    
     let s = match value {
         OutrValue::Bytes(v) => std::str::from_utf8(v.as_slice()).map_err(|e| {
             CompositionError::Unexpected(format!("OS_OUTPOINT must be utf-8 bytes 'txid:vout': {e}"))
@@ -389,7 +381,11 @@ fn parse_outpoint_payload(value: &OutrValue) -> Result<Vec<u8>, CompositionError
     let vout = parts[1].parse::<u32>().map_err(|e| {
         CompositionError::Unexpected(format!("invalid vout in OS_OUTPOINT '{}': {}", parts[1], e))
     })?;
-    let outpoint = Outpoint::new(txid, vout);
+    Ok(Outpoint::new(txid, vout))
+}
+
+fn parse_outpoint_payload(value: &OutrValue) -> Result<Vec<u8>, CompositionError> {
+    let outpoint = parse_outpoint(value)?;
     let bytes = outpoint
         .to_strict_serialized::<U32>()
         .map_err(|e| CompositionError::Unexpected(format!("OS_OUTPOINT strict encode failed: {e}")))?;
@@ -468,12 +464,10 @@ pub fn add_transition_states(
     beneficiary_seal: &BuilderSeal<GraphSeal>,
     change_seal: &BuilderSeal<GraphSeal>,
 ) -> Result<TransitionBuilder, CompositionError> {
-    let mut stashed_seal: Option<BuilderSeal<GraphSeal>> = None;
-println!("add_transition_states: abi= {:?}", abi);
-println!("add_transition_states: outputs= {:?}", outputs);
+    let mut j  = 0;
     for (i, value) in abi.iter().enumerate() {
-        let outr_value = &outputs[i];
-println!("outr_value: {:?}", outr_value);
+        let outr_value = &outputs[j];
+        j = j + 1;
         let abi_name = value
             .get("name")
             .and_then(|v| v.as_str())
@@ -549,67 +543,43 @@ println!("outr_value: {:?}", outr_value);
                     )));
                 }
             },
-            "owner" => {
-                if abi_reg != "s16" {
-                    return Err(CompositionError::Unexpected(format!(
-                        "ABI 'owner' at index {i}: expected reg {abi_reg} (expected s16)",
-                    )));
-                }
+            "owner_state" => {
                 // 解析state的格式为"txid:vout"，其后必须跟一个state值，然后一同添加到main_builder中
-                let s = match outr_value {
-                    OutrValue::Bytes(v) => std::str::from_utf8(v.as_slice())
-                        .map_err(|e| {
-                            CompositionError::Unexpected(format!(
-                                "state must be utf-8 bytes: {}",
-                                e
-                            ))
-                        })?,
-                    _ => {
-                        return Err(CompositionError::Unexpected(
-                            "state must be bytes encoded as 'txid:vout'".to_string(),
-                        ));
-                    }
-                };
-                let parts: Vec<&str> = s.split(':').collect();
-                if parts.len() != 2 {
-                    return Err(CompositionError::Unexpected(
-                        "state must be in the format of txid:vout".to_string(),
-                    ));
-                }
-                let txid = parts[0].parse::<Txid>().map_err(|e| {
-                    CompositionError::Unexpected(format!(
-                        "invalid txid in state '{}': {}",
-                        parts[0], e
-                    ))
-                })?;
-                let vout = parts[1].parse::<u32>().map_err(|e| {
-                    CompositionError::Unexpected(format!(
-                        "invalid vout in state '{}': {}",
-                        parts[1], e
-                    ))
-                })?;
-                let outpoint = Outpoint::new(txid, vout);
-                stashed_seal = Some(BuilderSeal::Revealed(GraphSeal::rand_from(outpoint)));
-            }
-            "amount" => {
+                let outpoint = parse_outpoint(outr_value)?;
+                let owner_seal = BuilderSeal::Revealed(GraphSeal::rand_from(outpoint));
+                let outr_value = &outputs[j];
+                j = j + 1;
                 if abi_reg != "a64" {
                     return Err(CompositionError::Unexpected(format!(
-                        "ABI 'amount' at index {i}: expected reg {abi_reg} (expected a64)",
+                        "ABI 'owner_state' at index {i}: expected reg {abi_reg} (expected a64)",
                     )));
                 }
-                let local_stashed_seal = stashed_seal.ok_or_else(|| {
-                    CompositionError::Unexpected(
-                        "state 'amount' encountered before 'owner'".to_string(),
-                    )
-                })?;
                 let amount = parse_amount(outr_value)?;
                 main_builder = main_builder.add_fungible_state_raw(
                     abi_type,
-                    local_stashed_seal,
+                    owner_seal,
                     amount,
                 )?;
-                stashed_seal = None;
             }
+            // "amount" => {
+            //     if abi_reg != "a64" {
+            //         return Err(CompositionError::Unexpected(format!(
+            //             "ABI 'amount' at index {i}: expected reg {abi_reg} (expected a64)",
+            //         )));
+            //     }
+            //     let local_stashed_seal = stashed_seal.ok_or_else(|| {
+            //         CompositionError::Unexpected(
+            //             "state 'amount' encountered before 'owner'".to_string(),
+            //         )
+            //     })?;
+            //     let amount = parse_amount(outr_value)?;
+            //     main_builder = main_builder.add_fungible_state_raw(
+            //         abi_type,
+            //         local_stashed_seal,
+            //         amount,
+            //     )?;
+            //     stashed_seal = None;
+            // }
             _ => {
                 return Err(CompositionError::Unexpected(format!(
                     "unknown ABI name {:?} at index {i}",

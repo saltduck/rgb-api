@@ -324,12 +324,8 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
             }
 
             let consignment = stock.export_contract(context.contract_id).map_err(|e| e.to_string())?;
-println!("consignment: {:?}", consignment);
             let mut bizlogic_runner_executed = false;
             if let Ok((interface, interface_libid)) = get_interface(&consignment) {
-                // got interface JSON from contract
-                println!("interface: {:?}", interface);
-
                 // got the inteface of this transition
                 let transition_details = &consignment
                     .schema
@@ -356,7 +352,6 @@ println!("consignment: {:?}", consignment);
                     })?;
                     let script_params =
                         generate_transition_parameters(parameters, sum_inputs, *amt)?;
-                    println!("script_params: {:?}", script_params);
                     
                     // run the transition bizlogic
                     // let bl_transition_validator = bl_transition_details.transition_schema.validator.unwrap();
@@ -367,7 +362,6 @@ println!("consignment: {:?}", consignment);
                         pos,
                         script_params
                     )?;
-                    println!("outputs: {:?}", outputs);
                     if outputs.len() < 2 {
                         return Err(CompositionError::Unexpected(
                             "validator outstack must provide at least received and change".to_string(),
@@ -380,7 +374,6 @@ println!("consignment: {:?}", consignment);
                             "interface JSON must contain \"returns\"".to_string(),
                         )
                     })?.as_array().unwrap();
-                    println!("abi: {:?}", abi);
 
                     // add wanted transition state to main_builder
                     let change_seal = create_change_output_seal(context.assignment_type, meta)?;
