@@ -40,7 +40,10 @@ pub mod scripts;
 pub use descriptor::bp_wallet_integration;
 pub use descriptor::{DescriptorRgb, RgbDescr, TapretKey, WpkhDescr};
 pub use errors::{CompletionError, CompositionError, PayError, WalletError};
-pub use pay::{PsbtMeta, TransferParams, WalletProvider, build_extra_transitions, create_change_output_seal};
+pub use pay::{
+    PsbtMeta, TransferParams, WalletProvider, apply_transition_schema_globals_from_contract_state,
+    build_extra_transitions, create_change_output_seal,
+};
 pub use rgbstd::*;
 pub mod resolvers {
     pub use rgbstd::indexers::AnyResolver;

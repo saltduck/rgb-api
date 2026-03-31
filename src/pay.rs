@@ -19,25 +19,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 
 use aluvm::library::LibId;
 // use aluvm::reg::CoreRegs;
-use amplify::confinement::{Confined, U24};
+use amplify::confinement::{Confined, U16 as MAX16, U24};
 use chrono::Utc;
 use psrgbt::{RgbOutExt, RgbPropKeyExt, RgbPsbtExt, TapretKeyError, Terminal};
 use rgbstd::containers::{Batch, BuilderSeal, Transfer};
-use rgbstd::contract::{AllocatedState, AssignmentsFilter, BuilderError};
+use rgbstd::contract::{AllocatedState, AssignmentsFilter, BuilderError, ContractData, TransitionBuilder};
 use rgbstd::invoice::{Amount, Beneficiary, InvoiceState, RgbInvoice};
-use rgbstd::persistence::{IndexProvider, StashInconsistency, StashProvider, StateProvider, Stock};
+use rgbstd::persistence::{ContractStateRead, IndexProvider, StashInconsistency, StashProvider, StateProvider, Stock};
 use rgbstd::rgbcore::dbc::tapret::{TapretCommitment, TapretProof};
 use rgbstd::rgbcore::dbc::Proof;
 use rgbstd::rgbcore::seals::txout::{CloseMethod, ExplicitSeal};
 use rgbstd::rgbcore::secp256k1::rand;
 use rgbstd::validation::WitnessOrdProvider;
+use rgbstd::schema::TransitionSchema;
 use rgbstd::{
-    AssignmentType, ContractId, GraphSeal, Opout, Outpoint, OutputSeal, RevealedData, RevealedState, Transition, TransitionType, Txid
+    AssignmentType, ContractId, GraphSeal, Opout, Outpoint, OutputSeal, RevealedData, RevealedState,
+    Transition, TransitionType, Txid,
 };
 use {
     aluvm::Vm,
@@ -266,6 +269,82 @@ fn select_state_for_invoice<S: StashProvider, H: StateProvider, I: IndexProvider
     Ok(prev_outputs)
 }
 
+/// For each global state type listed in the transition schema with a strictly positive minimum
+/// occurrence count, append that many copies of the **latest** on-chain global value (same
+/// `RevealedData` as in contract state). This matches common schemas that require each transition
+/// to re-attach or extend global history without changing the payload.
+#[allow(clippy::result_large_err)]
+pub fn apply_transition_schema_globals_from_contract_state<S: ContractStateRead>(
+    mut builder: TransitionBuilder,
+    contract: &ContractData<S>,
+    transition_schema: &TransitionSchema,
+) -> Result<TransitionBuilder, CompositionError> {
+    for (type_id, occ) in transition_schema.globals.iter() {
+        let n = occ.min_value();
+        if n == 0 {
+            continue;
+        }
+
+        let mut global_it = contract
+            .state
+            .global(*type_id)
+            .map_err(|_| {
+                CompositionError::Unexpected(format!(
+                    "transition schema requires global type {} but it is absent from contract state",
+                    u16::from(*type_id)
+                ))
+            })?;
+
+        let Some(head) = global_it.next() else {
+            return Err(CompositionError::Unexpected(format!(
+                "transition requires {} global item(s) of type {} but the contract has no history \
+                 for that type (nothing to carry forward)",
+                n,
+                u16::from(*type_id)
+            )));
+        };
+
+        let global_details = contract
+            .schema
+            .global_types
+            .get(type_id)
+            .ok_or_else(|| {
+                CompositionError::Unexpected(format!(
+                    "transition schema uses global type {} which is not listed in schema.global_types",
+                    u16::from(*type_id)
+                ))
+            })?;
+        let sem_id = global_details.global_state_schema.sem_id;
+        let field_name = global_details.name.clone();
+
+        let typed_val = contract
+            .types
+            .strict_deserialize_type(sem_id, head.borrow().data().as_slice())
+            .map_err(|e| {
+                CompositionError::Unexpected(format!(
+                    "contract global type {} data in stash does not match schema ({}): {e}",
+                    u16::from(*type_id),
+                    sem_id
+                ))
+            })?;
+
+        // `TransitionBuilder` only exposes `add_global_state` with `StrictSerialize`; re-pack bytes
+        // via the type system so we use the same strict-encoding universe as rgbstd.
+        #[allow(deprecated)]
+        let encoded = contract
+            .types
+            .strict_serialize_type::<MAX16>(&typed_val)
+            .map_err(|e| CompositionError::Unexpected(format!("global strict re-serialize: {e}")))?;
+
+        for _ in 0..n {
+            builder = builder
+                .add_global_state(field_name.clone(), encoded.clone())
+                .map_err(|e| CompositionError::Unexpected(e.to_string()))?;
+        }
+    }
+    Ok(builder)
+}
+
 #[allow(clippy::result_large_err)]
 fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
     stock: &Stock<S, H, I>,
@@ -432,6 +511,25 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
         return Err(CompositionError::InsufficientState);
     }
 
+    let contract = stock
+        .contract_data(context.contract_id)
+        .map_err(|e| e.to_string())?;
+    let schema = stock
+        .as_stash_provider()
+        .contract_schema(context.contract_id)
+        .map_err(|e| e.to_string())?;
+    let transition_details = schema.transitions.get(&context.transition_type).ok_or_else(|| {
+        CompositionError::Unexpected(format!(
+            "schema has no transition type {:?}",
+            context.transition_type
+        ))
+    })?;
+    main_builder = apply_transition_schema_globals_from_contract_state(
+        main_builder,
+        &contract,
+        &transition_details.transition_schema,
+    )?;
+
     let transition = main_builder.complete_transition()?;
     Ok(transition)
 }
@@ -504,6 +602,20 @@ pub fn build_extra_transitions<S: StashProvider, H: StateProvider, I: IndexProvi
                 if !extra_builder.has_inputs() {
                     continue;
                 }
+
+                let contract = stock.contract_data(id).map_err(|e| e.to_string())?;
+                let transition_details = schema.transitions.get(&transition_type).ok_or_else(|| {
+                    CompositionError::Unexpected(format!(
+                        "schema has no transition type {:?} for contract {}",
+                        transition_type, id
+                    ))
+                })?;
+                extra_builder = apply_transition_schema_globals_from_contract_state(
+                    extra_builder,
+                    &contract,
+                    &transition_details.transition_schema,
+                )?;
+
                 let transition = extra_builder.complete_transition()?;
                 extras
                     .push(transition)

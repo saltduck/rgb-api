@@ -930,6 +930,7 @@ impl Exec for RgbArgs {
                 consignment: out_file,
             } => {
                 use std::collections::HashMap;
+                use std::env;
 
                 use psrgbt::{RgbOutExt, RgbPsbtExt};
                 use rgb::containers::Batch;
@@ -946,6 +947,9 @@ impl Exec for RgbArgs {
 
                 let mut wallet = self.rgb_wallet(&config)?;
                 let params = TransferParams::with(*fee, *sats);
+                let transit_debug = env::var("RGB_TRANSIT_DEBUG")
+                    .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                    .unwrap_or(false);
 
                 let export = wallet
                     .stock()
@@ -1013,21 +1017,24 @@ impl Exec for RgbArgs {
                         .unwrap_or(contract.schema.owned_types.keys().next().unwrap());
 
                     let mut prev_outputs = std::collections::BTreeSet::new();
-                    for details in contract.schema.owned_types.values() {
-                        if let Ok(allocs) = contract.fungible(details.name.clone(), &filter) {
-                            for a in allocs {
-                                prev_outputs.insert(a.seal);
-                            }
+                    for assignment_type in contract.schema.owned_types.keys().copied() {
+                        for a in contract
+                            .fungible_raw(assignment_type, &filter)
+                            .map_err(|e| e.to_string())?
+                        {
+                            prev_outputs.insert(a.seal);
                         }
-                        if let Ok(allocs) = contract.data(details.name.clone(), &filter) {
-                            for a in allocs {
-                                prev_outputs.insert(a.seal);
-                            }
+                        for a in contract
+                            .data_raw(assignment_type, &filter)
+                            .map_err(|e| e.to_string())?
+                        {
+                            prev_outputs.insert(a.seal);
                         }
-                        if let Ok(allocs) = contract.rights(details.name.clone(), &filter) {
-                            for a in allocs {
-                                prev_outputs.insert(a.seal);
-                            }
+                        for a in contract
+                            .rights_raw(assignment_type, &filter)
+                            .map_err(|e| e.to_string())?
+                        {
+                            prev_outputs.insert(a.seal);
                         }
                     }
                     (prev_outputs, default_at)
@@ -1037,6 +1044,12 @@ impl Exec for RgbArgs {
                     return Err(WalletError::Custom(
                         "no unspent state found for this contract".to_string(),
                     ));
+                }
+                if transit_debug {
+                    eprintln!(
+                        "[transit-debug] selected prev outputs: {}",
+                        prev_outputs.len()
+                    );
                 }
 
                 let prev_outpoints = prev_outputs
@@ -1111,6 +1124,21 @@ impl Exec for RgbArgs {
                         }
                     }
                 }
+                if transit_debug {
+                    let mut pairs: Vec<String> = input_type_counts
+                        .iter()
+                        .map(|(ty, c)| format!("{}={}", u16::from(*ty), c))
+                        .collect();
+                    pairs.sort();
+                    eprintln!(
+                        "[transit-debug] input assignment counts: {}",
+                        if pairs.is_empty() {
+                            "(empty)".to_string()
+                        } else {
+                            pairs.join(", ")
+                        }
+                    );
+                }
                 for (type_id, occ) in &transition_details.transition_schema.inputs {
                     let found = input_type_counts.get(type_id).copied().unwrap_or(0);
                     if let Err(mismatch) = occ.check(found) {
@@ -1152,8 +1180,18 @@ impl Exec for RgbArgs {
                 )
                 .map_err(|e| e.to_string())?;
 
+                let contract = wallet
+                    .stock()
+                    .contract_data(*contract_id)
+                    .map_err(|e| e.to_string())?;
+                main_builder = rgb::pay::apply_transition_schema_globals_from_contract_state(
+                    main_builder,
+                    &contract,
+                    &transition_details.transition_schema,
+                )
+                .map_err(|e| e.to_string())?;
+
                 let transition = main_builder.complete_transition()?;
-println!("transition: {:#?}", transition);
 
                 let extras =
                     build_extra_transitions(wallet.stock(), *contract_id, &prev_outputs, &meta)

@@ -549,17 +549,29 @@ pub fn add_transition_states(
                 let owner_seal = BuilderSeal::Revealed(GraphSeal::rand_from(outpoint));
                 let outr_value = &outputs[j];
                 j = j + 1;
-                if abi_reg != "a64" {
-                    return Err(CompositionError::Unexpected(format!(
-                        "ABI 'owner_state' at index {i}: expected reg {abi_reg} (expected a64)",
-                    )));
+                match abi_reg {
+                    "a64" => {
+                        let amount = parse_amount(outr_value)?;
+                        main_builder = main_builder.add_fungible_state_raw(
+                            abi_type,
+                            owner_seal,
+                            amount,
+                        )?;
+                    }
+                    "a8" => {
+                        // if *outr_value == OutrValue::Int(0) {
+                        //     return Err(CompositionError::Unexpected(format!(
+                        //         "ABI 'owner_state' at index {i}: expected a8 to be non-zero",
+                        //     )));
+                        // }
+                        main_builder = main_builder.add_rights_raw(abi_type, owner_seal)?;
+                    }
+                    other => {
+                        return Err(CompositionError::Unexpected(format!(
+                            "ABI 'owner_state' at index {i}: unsupported reg {other} (expected a64, a8)",
+                        )));
+                    }
                 }
-                let amount = parse_amount(outr_value)?;
-                main_builder = main_builder.add_fungible_state_raw(
-                    abi_type,
-                    owner_seal,
-                    amount,
-                )?;
             }
             // "amount" => {
             //     if abi_reg != "a64" {
