@@ -26,8 +26,8 @@ use rgbstd::persistence::{IndexProvider, StashInconsistency, StashProvider, Stat
 use rgbstd::rgbcore::dbc::tapret::{TapretCommitment, TapretProof};
 use rgbstd::rgbcore::dbc::Proof;
 use rgbstd::rgbcore::secp256k1::rand;
-use rgbstd::validation::WitnessOrdProvider;
-use rgbstd::containers::{Consignment, ConsignmentExt};
+use rgbstd::validation::{ResolveWitness, ValidationConfig, ValidationError, WitnessOrdProvider};
+use rgbstd::containers::{Consignment, ConsignmentExt, ValidConsignment};
 use rgbstd::vm::{ContractStateAccess, ContractStateEvolve, OrdOpRef, RgbIsa};
 use rgbstd::{
     AssignmentType, ContractId, GraphSeal, OpId, Operation, Opout, Outpoint, OutputSeal, RevealedData,
@@ -602,6 +602,28 @@ pub fn add_transition_states(
     }
     Ok(main_builder)
 }
+
+/// Extension trait: call `validate_ext` after `use ...::ConsignmentValidateExt`.
+// pub trait ConsignmentValidateExt<const TRANSFER: bool> {
+//     fn validate_ext(
+//         self,
+//         resolver: &impl ResolveWitness,
+//         validation_config: &ValidationConfig,
+//         extra_states: Option<Vec<MemContractState>>,
+//     ) -> Result<ValidConsignment<TRANSFER>, ValidationError>;
+// }
+
+// impl<const TRANSFER: bool> ConsignmentValidateExt<TRANSFER> for Consignment<TRANSFER> {
+//     fn validate_ext(
+//         self,
+//         resolver: &impl ResolveWitness,
+//         validation_config: &ValidationConfig,
+//         extra_states: Option<Vec<MemContractState>>,
+//     ) -> Result<ValidConsignment<TRANSFER>, ValidationError> {
+//         let _ = extra_states;
+//         self.validate_ext(resolver, validation_config, extra_states)
+//     }
+// }
 
 #[cfg(test)]
 mod tests {

@@ -44,7 +44,9 @@ use rgb::schema::SchemaId;
 use rgb::validation::{ValidationConfig, Validity};
 use rgb::vm::{RgbIsa, WitnessOrd};
 use rgb::{
-    Allocation, BundleId, CompositionError, ContractId, GenesisSeal, GraphSeal, Identity, OpId, Outpoint, OutputSeal, OwnedFraction, RgbDescr, RgbWallet, StateType, TokenIndex, TransferParams, Txid, WalletError, WalletProvider
+    Allocation, BundleId, CompositionError, ContractId, GenesisSeal,
+    GraphSeal, Identity, OpId, Outpoint, OutputSeal, OwnedFraction, RgbDescr, RgbWallet, StateType,
+    TokenIndex, TransferParams, Txid, WalletError, WalletProvider,
 };
 use rgbstd::contract::{AllocatedState, AssignmentsFilter, ContractData, ContractOp};
 use rgbstd::persistence::MemContractState;
@@ -1458,7 +1460,7 @@ impl Exec for RgbArgs {
                 eprintln!("Dump is successfully generated and saved to '{root_dir}'");
             }
             Command::Validate { file } => {
-                self.rgb_stock()?;
+                let stock = self.rgb_stock()?;
                 let mut resolver = self.resolver()?;
                 let consignment = Transfer::load_file(file)?;
                 resolver.add_consignment_txes(&consignment);
@@ -1467,7 +1469,13 @@ impl Exec for RgbArgs {
                     trusted_typesystem: consignment.types.clone(),
                     ..Default::default()
                 };
-                let validated_consignment = consignment.validate(&resolver, &validation_config)?;
+                let state = stock.as_state_provider();
+                let extra_states = Some(vec![std::slice::from_ref(state)]);
+                let validated_consignment = consignment.validate_extra_states(
+                    &resolver,
+                    &validation_config,
+                    extra_states,
+                )?;
                 let status = validated_consignment.validation_status();
                 if status.validity() == Validity::Valid {
                     eprintln!("The provided consignment is valid")
@@ -1486,7 +1494,13 @@ impl Exec for RgbArgs {
                     trusted_typesystem: transfer.types.clone(),
                     ..Default::default()
                 };
-                let valid = transfer.validate(&resolver, &validation_config)?;
+                let state = stock.as_state_provider();
+                let extra_states = Some(vec![std::slice::from_ref(state)]);
+                let valid = transfer.validate_extra_states(
+                    &resolver,
+                    &validation_config,
+                    extra_states,
+                )?;
                 stock.accept_transfer(valid, &resolver)?;
                 eprintln!("Transfer accepted into the stash");
             }
