@@ -1162,7 +1162,7 @@ impl Exec for RgbArgs {
                     )
                 })?;
                 let script_params =
-                    generate_transition_parameters_from_args(parameters, &args_map, sum_inputs)
+                    generate_transition_parameters_from_args(parameters, &args_map, sum_inputs, &prev_outputs)
                         .map_err(|e| e.to_string())?;
 
                 let outputs =
@@ -1174,6 +1174,7 @@ impl Exec for RgbArgs {
                         .map_err(|e| e.to_string())?;
                 let ben_seal = beneficiary_seal.as_ref().unwrap_or(&change_seal);
                 main_builder = add_transition_states(
+                    &export,
                     abi,
                     &outputs,
                     main_builder,

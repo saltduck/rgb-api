@@ -14,7 +14,7 @@ use aluvm::data::{ByteStr, Number};
 use aluvm::library::{LibId, LibSite};
 use aluvm::reg::{Reg8, Reg16, Reg32, RegAFR, RegR, RegS};
 // use aluvm::reg::CoreRegs;
-use amplify::confinement::{Confined, TinyBlob, U24, U32};
+use amplify::confinement::{Confined, TinyBlob, U16 as MAX16, U24, U32};
 use amplify::hex::FromHex;
 use amplify::num::u5;
 use chrono::Utc;
@@ -37,7 +37,8 @@ use {
     aluvm::Vm,
     aluvm::isa::{Instr, InstructionSet, OutrValue},
 };
-use strict_types::StrictSerialize;
+use strict_types::{StrictSerialize, StrictVal, Ty, TypeRef};
+use strict_types::value::Blob;
 use rgbstd::Vout; // 或你本地的 vout 类型
 
 use crate::filters::{Filter, WalletFilter};
@@ -52,7 +53,7 @@ pub struct ScriptParam {
     pub value: String,
 }
 
-use rgbstd::schema::Schema;
+use rgbstd::schema::{OwnedStateSchema, Schema};
 use rgbstd::persistence::{MemContract, MemContractState};
 
 /// Matches `rgbcore::vm::contract::OpInfo` layout (keep in sync with rgb-consensus).
@@ -92,6 +93,7 @@ pub fn run_script<const TRANSFER: bool>(
     let mut vm = Vm::<Instr<RgbIsa<M>>>::new();
     vm.registers.set_outstack_limit(1024);
     for param in params {
+        println!("**************** param: {:?}", param);
         match param.reg_name.as_str() {
             "a64" => {
                 let _ = vm.registers.set_a64(
@@ -99,11 +101,18 @@ pub fn run_script<const TRANSFER: bool>(
                     param.value.parse::<u64>().unwrap(),
                 );
             }
+            "a32" => {
+                let _ = vm.registers.set_a32(
+                    Reg32::from(u5::try_from(param.idx).unwrap()),
+                    param.value.parse::<u32>().unwrap(),
+                );
+            }
             "r256" => {
+                let n = parse_r256_number_forward(&param.value)?;
                 let _ = vm.registers.set_n(
                     RegAFR::R(RegR::R256),
                     Reg32::from(u5::try_from(param.idx).unwrap()),
-                    Number::from_hex(&param.value).unwrap(),
+                    n,
                 );
             }
             "s16" => {
@@ -269,12 +278,30 @@ pub fn generate_transition_parameters(
         let param_reg = input.get("reg").and_then(|v| v.as_str()).unwrap_or_default();
         let param_name = input.get("name").and_then(|v| v.as_str()).unwrap_or_default();
         match param_name {
-            "inputs" | "sum_inputs" if param_reg == "a64" => {
-                script_params.push(ScriptParam {
-                    reg_name: "a64".to_string(),
-                    idx: 0,
-                    value: u64::from(sum_inputs).to_string(),
-                });
+            "inputs" | "sum_inputs" => {
+                match param_reg {
+                    "a64" => {
+                        script_params.push(ScriptParam {
+                            reg_name: "a64".to_string(),
+                            idx: 0,
+                            value: u64::from(sum_inputs).to_string(),
+                        });
+                    }
+                    // "s16" => {
+                    //     script_params.push(ScriptParam {
+                    //         reg_name: "s16".to_string(),
+                    //         idx: 0,
+                    //         value: parse_outpoint(prev_outputs)?.to_string(),
+                    //     });
+                    // }
+                    _ => {
+                        return Err(CompositionError::Unexpected(format!(
+                            "Invalid parameter name: {} for type: {}",
+                            param_name,
+                            param_reg,
+                        )));
+                    }
+                }
             }
             "amount" | "amt" if param_reg == "a64" => {
                 script_params.push(ScriptParam {
@@ -300,6 +327,7 @@ pub fn generate_transition_parameters_from_args(
     parameters: &serde_json::Value,
     args: &std::collections::HashMap<String, String>,
     sum_inputs: Amount,
+    prev_outputs: &BTreeSet<OutputSeal>,
 ) -> Result<Vec<ScriptParam>, CompositionError> {
     let Some(rows) = parameters.as_array() else {
         return Err(CompositionError::Unexpected(
@@ -316,23 +344,59 @@ pub fn generate_transition_parameters_from_args(
             .get("reg")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        let value = match param_name {
-            "inputs" | "sum_inputs" => u64::from(sum_inputs).to_string(),
-            other => args
-                .get(other)
-                .ok_or_else(|| {
-                    CompositionError::Unexpected(format!(
-                        "missing required arg '{}' for transition parameter",
-                        other
-                    ))
-                })?
-                .clone(),
+        match param_name {
+            "inputs" | "sum_inputs" => {
+                match param_reg {
+                    "a64" => {
+                        script_params.push(ScriptParam {
+                            reg_name: param_reg.to_string(),
+                            idx: idx as u8,
+                            value: u64::from(sum_inputs).to_string(),
+                        });
+                    }
+                    "outpoint" => {
+                        let output = prev_outputs.iter().next().ok_or_else(|| {
+                            CompositionError::Unexpected(
+                                "missing previous outputs for s16 input".to_string(),
+                            )
+                        })?;
+                        script_params.push(ScriptParam {
+                            reg_name: "r256".to_string(),
+                            idx: idx as u8,
+                            value: "0x".to_string() + &output.txid.to_string(),
+                        });
+                        script_params.push(ScriptParam {
+                            reg_name: "a32".to_string(),
+                            idx: idx as u8,
+                            value: output.vout.to_u32().to_string(),
+                        });
+                    }
+                    _ => {
+                        return Err(CompositionError::Unexpected(format!(
+                            "Invalid parameter name: {} for type: {}",
+                            param_name,
+                            param_reg,
+                        )));
+                    }
+                }
+            },
+            other => {
+                let value = args
+                    .get(other)
+                    .ok_or_else(|| {
+                        CompositionError::Unexpected(format!(
+                            "missing required arg '{}' for transition parameter",
+                            other
+                        ))
+                    })?
+                    .clone();
+                script_params.push(ScriptParam {
+                    reg_name: param_reg.to_string(),
+                    idx: idx as u8,
+                    value: value,
+                });
+            }
         };
-        script_params.push(ScriptParam {
-            reg_name: param_reg.to_string(),
-            idx: idx as u8,
-            value,
-        });
     }
     Ok(script_params)
 }
@@ -356,6 +420,149 @@ pub fn parse_string(value: &OutrValue) -> Result<Vec<u8>, CompositionError> {
             "string/data must be bytes OUTR value, got {other:?}"
         ))),
     }
+}
+
+fn parse_s16_payload<const TRANSFER: bool>(
+    consignment: &Consignment<TRANSFER>,
+    assignment_type: AssignmentType,
+    value: &OutrValue,
+) -> Result<Vec<u8>, CompositionError> {
+    let raw = parse_string(value)?;
+    let assignment = consignment
+        .schema
+        .owned_types
+        .get(&assignment_type)
+        .ok_or_else(|| {
+            CompositionError::Unexpected(format!(
+                "assignment type {} is not listed in schema.owned_types",
+                u16::from(assignment_type)
+            ))
+        })?;
+
+    let OwnedStateSchema::Structured(sem_id) = assignment.owned_state_schema else {
+        return Err(CompositionError::Unexpected(format!(
+            "s16 return requires structured assignment type {}, got {:?}",
+            u16::from(assignment_type),
+            assignment.owned_state_schema
+        )));
+    };
+
+    if consignment
+        .types
+        .strict_deserialize_type(sem_id, raw.as_slice())
+        .is_ok()
+    {
+        return Ok(raw);
+    }
+
+    let ty = consignment.types.find(sem_id).ok_or_else(|| {
+        CompositionError::Unexpected(format!(
+            "schema type system does not contain sem id {sem_id} for assignment type {}",
+            u16::from(assignment_type)
+        ))
+    })?;
+    if let Some(len) = target_byte_array_len(&consignment.types, ty) {
+        let bytes = parse_fixed_bytes(&raw, len, assignment_type)?;
+        let typed_val = consignment
+            .types
+            .typify(StrictVal::Bytes(Blob(bytes)), sem_id)
+            .map_err(|e| {
+                CompositionError::Unexpected(format!(
+                    "s16 bytes do not match assignment type {} ({sem_id}): {e}",
+                    u16::from(assignment_type)
+                ))
+            })?;
+        let encoded = consignment
+            .types
+            .strict_serialize_value::<MAX16>(&typed_val)
+            .map_err(|e| CompositionError::Unexpected(format!("s16 strict serialize: {e}")))?;
+        return Ok(encoded.release());
+    }
+
+    let text = std::str::from_utf8(raw.as_slice()).map_err(|e| {
+        CompositionError::Unexpected(format!("s16 structured value must be utf-8 text: {e}"))
+    })?;
+    let typed_val = consignment
+        .types
+        .typify(StrictVal::from(text), sem_id)
+        .map_err(|e| {
+            CompositionError::Unexpected(format!(
+                "s16 value does not match assignment type {} ({sem_id}): {e}",
+                u16::from(assignment_type)
+            ))
+        })?;
+    let encoded = consignment
+        .types
+        .strict_serialize_value::<MAX16>(&typed_val)
+        .map_err(|e| CompositionError::Unexpected(format!("s16 strict serialize: {e}")))?;
+    Ok(encoded.release())
+}
+
+fn target_byte_array_len(
+    types: &strict_types::TypeSystem,
+    ty: &Ty<strict_types::SemId>,
+) -> Option<usize> {
+    match ty {
+        Ty::Array(id, len) if id.is_byte() => Some(*len as usize),
+        Ty::Tuple(fields) if fields.len() == 1 => fields
+            .first()
+            .and_then(|id| types.find(*id))
+            .and_then(|inner| target_byte_array_len(types, inner)),
+        _ => None,
+    }
+}
+
+fn parse_fixed_bytes(
+    raw: &[u8],
+    len: usize,
+    assignment_type: AssignmentType,
+) -> Result<Vec<u8>, CompositionError> {
+    if raw.len() == len {
+        return Ok(raw.to_vec());
+    }
+    let text = std::str::from_utf8(raw).map_err(|e| {
+        CompositionError::Unexpected(format!(
+            "s16 bytes for assignment type {} must be {len} raw bytes or hex text: {e}",
+            u16::from(assignment_type)
+        ))
+    })?;
+    let hex = text
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| text.trim().strip_prefix("0X"))
+        .unwrap_or_else(|| text.trim());
+    let bytes = Vec::<u8>::from_hex(hex).map_err(|e| {
+        CompositionError::Unexpected(format!(
+            "s16 fixed bytes for assignment type {} expects {len} raw bytes or {} hex chars: {e}",
+            u16::from(assignment_type),
+            len * 2
+        ))
+    })?;
+    if bytes.len() != len {
+        return Err(CompositionError::Unexpected(format!(
+            "s16 fixed bytes for assignment type {} expects {len} bytes, got {} bytes",
+            u16::from(assignment_type),
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn parse_r256_number_forward(value: &str) -> Result<Number, CompositionError> {
+    let hex = value.trim().trim_start_matches("0x").trim_start_matches("0X");
+    let mut bytes = Vec::<u8>::from_hex(hex).map_err(|e| {
+        CompositionError::Unexpected(format!("r256 expects valid hex string: {e}"))
+    })?;
+    if bytes.len() != 32 {
+        return Err(CompositionError::Unexpected(format!(
+            "r256 expects exactly 32 bytes (64 hex chars), got {} bytes",
+            bytes.len()
+        )));
+    }
+    // AluVM Number stores integer bytes in little-endian order.
+    // Reverse user-provided hex (big-endian textual order) to keep script-side semantics forward.
+    bytes.reverse();
+    Ok(Number::from_slice(bytes))
 }
 
 fn parse_outpoint(value: &OutrValue) -> Result<Outpoint, CompositionError> {    
@@ -457,7 +664,8 @@ pub fn get_interface<const TRANSFER: bool>(
     Ok((interface, interface_libid))
 }
 
-pub fn add_transition_states(
+pub fn add_transition_states<const TRANSFER: bool>(
+    consignment: &Consignment<TRANSFER>,
     abi: &Vec<serde_json::Value>,
     outputs: &Vec<OutrValue>,
     mut main_builder: TransitionBuilder,
@@ -467,6 +675,7 @@ pub fn add_transition_states(
     let mut j  = 0;
     for (i, value) in abi.iter().enumerate() {
         let outr_value = &outputs[j];
+        println!("**************** index: {j}, outr_value: {:?}", outr_value);
         j = j + 1;
         let abi_name = value
             .get("name")
@@ -526,7 +735,7 @@ pub fn add_transition_states(
                         RevealedData::new(payload),
                     )?;
                 }
-                "s16" => {
+                "outpoint" => {
                     let raw = parse_outpoint_payload(outr_value)?;
                     let payload = Confined::try_from_iter(raw.into_iter()).map_err(|e| {
                         CompositionError::Unexpected(format!("OS_OUTPOINT RevealedData: {e}"))
@@ -535,6 +744,16 @@ pub fn add_transition_states(
                         abi_type,
                         change_seal.clone(),
                         RevealedData::new(payload),
+                    )?;
+                }
+                "s16" => {
+                    let data = parse_s16_payload(consignment, abi_type, outr_value)?;
+                    main_builder = main_builder.add_data_raw(
+                        abi_type,
+                        change_seal.clone(),
+                        RevealedData::new(Confined::try_from(data).map_err(|e| {
+                            CompositionError::Unexpected(format!("String RevealedData: {e}"))
+                        })?),
                     )?;
                 }
                 other => {
@@ -566,9 +785,30 @@ pub fn add_transition_states(
                         // }
                         main_builder = main_builder.add_rights_raw(abi_type, owner_seal)?;
                     }
+                    "outpoint" => {
+                        let raw = parse_outpoint_payload(outr_value)?;
+                        let payload = Confined::try_from_iter(raw.into_iter()).map_err(|e| {
+                            CompositionError::Unexpected(format!("OS_OUTPOINT RevealedData: {e}"))
+                        })?;
+                        main_builder = main_builder.add_data_raw(
+                            abi_type,
+                            owner_seal,
+                            RevealedData::new(payload),
+                        )?;
+                    }
+                    "s16" => {
+                        let data = parse_s16_payload(consignment, abi_type, outr_value)?;
+                        main_builder = main_builder.add_data_raw(
+                            abi_type,
+                            owner_seal,
+                            RevealedData::new(Confined::try_from(data).map_err(|e| {
+                                CompositionError::Unexpected(format!("String RevealedData: {e}"))
+                            })?),
+                        )?;
+                    }
                     other => {
                         return Err(CompositionError::Unexpected(format!(
-                            "ABI 'owner_state' at index {i}: unsupported reg {other} (expected a64, a8)",
+                            "ABI 'owner_state' at index {i}: unsupported reg {other} (expected a64, a8, outpoint or s16)",
                         )));
                     }
                 }

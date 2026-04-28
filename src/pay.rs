@@ -457,6 +457,7 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                     // add wanted transition state to main_builder
                     let change_seal = create_change_output_seal(context.assignment_type, meta)?;
                     main_builder = add_transition_states(
+                        &consignment,
                         abi,
                         &outputs,
                         main_builder,
