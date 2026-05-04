@@ -44,7 +44,7 @@ use rgb::schema::SchemaId;
 use rgb::validation::{ValidationConfig, Validity};
 use rgb::vm::{RgbIsa, WitnessOrd};
 use rgb::{
-    Allocation, BundleId, CompositionError, ContractId, GenesisSeal,
+    Allocation, BundleId, ContractId, GenesisSeal,
     GraphSeal, Identity, OpId, Outpoint, OutputSeal, OwnedFraction, RgbDescr, RgbWallet, StateType,
     TokenIndex, TransferParams, Txid, WalletError, WalletProvider,
 };
@@ -941,11 +941,11 @@ impl Exec for RgbArgs {
                 use rgb::pay::{build_extra_transitions, create_change_output_seal};
                 use rgb::scripts::{
                     add_transition_states, generate_transition_parameters_from_args, get_interface,
-                    main_assignment_type_from_returns_abi, run_script,
+                    main_assignment_type_from_returns_abi, run_script_with_contract_state,
                 };
                 use rgb::validation::WitnessOrdProvider;
                 use rgb::vm::WitnessOrd;
-                use rgb::{TransitionType, WalletProvider as _};
+                use rgb::WalletProvider as _;
 
                 let mut wallet = self.rgb_wallet(&config)?;
                 let params = TransferParams::with(*fee, *sats);
@@ -1165,8 +1165,18 @@ impl Exec for RgbArgs {
                     generate_transition_parameters_from_args(parameters, &args_map, sum_inputs, &prev_outputs)
                         .map_err(|e| e.to_string())?;
 
+                let script_contract = wallet
+                    .stock()
+                    .contract_data(*contract_id)
+                    .map_err(|e| e.to_string())?;
                 let outputs =
-                    run_script(&export, interface_libid, script_pos, script_params)
+                    run_script_with_contract_state(
+                        &export,
+                        interface_libid,
+                        script_pos,
+                        script_params,
+                        script_contract.state,
+                    )
                         .map_err(|e| e.to_string())?;
 
                 let change_seal =

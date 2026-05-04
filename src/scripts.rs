@@ -88,8 +88,18 @@ pub fn run_script<const TRANSFER: bool>(
     type M = MemContract<MemContractState>;
 
     let init_ctx = (&consignment.schema, consignment.contract_id());
-    let contract_state = Rc::new(RefCell::new(M::init(init_ctx)));
+    let contract_state = M::init(init_ctx);
+    run_script_with_contract_state(consignment, lib_id, pos, params, contract_state)
+}
 
+pub fn run_script_with_contract_state<const TRANSFER: bool, M: ContractStateAccess>(
+    consignment: &Consignment<TRANSFER>,
+    lib_id: LibId,
+    pos: u16,
+    params: Vec<ScriptParam>,
+    contract_state: M,
+) -> Result<Vec<OutrValue>, CompositionError> {
+    let contract_state = Rc::new(RefCell::new(contract_state));
     let mut vm = Vm::<Instr<RgbIsa<M>>>::new();
     vm.registers.set_outstack_limit(1024);
     for param in params {
@@ -119,6 +129,23 @@ pub fn run_script<const TRANSFER: bool>(
                 let _ = vm.registers.set_s16(
                     RegS::from(u5::try_from(param.idx).unwrap()),
                     ByteStr::from(ByteStr::with(param.value.as_bytes())),
+                );
+            }
+            "outpoint" => {
+                let _ = vm.registers.set_s16(
+                    RegS::from(u5::try_from(param.idx).unwrap()),
+                    ByteStr::from(ByteStr::with(param.value.as_bytes())),
+                );
+                // 将param.value解析为outpoint，设置到r256和a32中
+                let outpoint = parse_outpoint(&OutrValue::Bytes(param.value.as_bytes().to_vec()))?;
+                let _ = vm.registers.set_n(
+                    RegAFR::R(RegR::R256),
+                    Reg32::from(u5::try_from(param.idx).unwrap()),
+                    parse_r256_number_forward(&outpoint.txid.to_string())?,
+                );
+                let _ = vm.registers.set_a32(
+                    Reg32::from(u5::try_from(param.idx).unwrap()),
+                    outpoint.vout,
                 );
             }
             _ => {
@@ -651,7 +678,7 @@ pub fn get_interface<const TRANSFER: bool>(
             &consignment, 
             interface_libid, 
             0, 
-            Vec::<ScriptParam>::new()
+            Vec::<ScriptParam>::new(),
         ).map_err(|e| e.to_string())?;
     if interface_outr_values.len() != 1 {
         return Err(CompositionError::Unexpected(
@@ -785,6 +812,17 @@ pub fn add_transition_states<const TRANSFER: bool>(
                         // }
                         main_builder = main_builder.add_rights_raw(abi_type, owner_seal)?;
                     }
+                    "r256" => {
+                        let hash = parse_hash256(outr_value)?;
+                        let payload = Confined::try_from_iter(hash.iter().copied()).map_err(|e| {
+                            CompositionError::Unexpected(format!("OS_HASH RevealedData: {e}"))
+                        })?;
+                        main_builder = main_builder.add_data_raw(
+                            abi_type,
+                            owner_seal,
+                            RevealedData::new(payload),
+                        )?;
+                    }
                     "outpoint" => {
                         let raw = parse_outpoint_payload(outr_value)?;
                         let payload = Confined::try_from_iter(raw.into_iter()).map_err(|e| {
@@ -808,7 +846,7 @@ pub fn add_transition_states<const TRANSFER: bool>(
                     }
                     other => {
                         return Err(CompositionError::Unexpected(format!(
-                            "ABI 'owner_state' at index {i}: unsupported reg {other} (expected a64, a8, outpoint or s16)",
+                            "ABI 'owner_state' at index {i}: unsupported reg {other} (expected a64, a8, r256, outpoint or s16)",
                         )));
                     }
                 }

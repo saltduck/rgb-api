@@ -23,7 +23,6 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 
-use aluvm::library::LibId;
 // use aluvm::reg::CoreRegs;
 use amplify::confinement::{Confined, U16 as MAX16, U24};
 use chrono::Utc;
@@ -39,23 +38,18 @@ use rgbstd::rgbcore::secp256k1::rand;
 use rgbstd::validation::WitnessOrdProvider;
 use rgbstd::schema::TransitionSchema;
 use rgbstd::{
-    AssignmentType, ContractId, GraphSeal, Opout, Outpoint, OutputSeal, RevealedData, RevealedState,
+    AssignmentType, ContractId, GraphSeal, Opout, Outpoint, OutputSeal, RevealedData,
     Transition, TransitionType, Txid,
-};
-use {
-    aluvm::Vm,
-    aluvm::isa::{Instr, OutrValue},
 };
 // use rgbstd::vm::{OrdOpRef};
 // use rgbstd::vm::contract::{VmContext, OpInfo};
-use rgbstd::Vout; // 或你本地的 vout 类型
 
 use crate::filters::{Filter, WalletFilter};
 use crate::invoice::NonFungible;
 use crate::validation::WitnessResolverError;
 use crate::vm::WitnessOrd;
 use crate::{CompletionError, CompositionError, PayError, WalletError};
-use crate::scripts::{ScriptParam, add_transition_states, base62_to_hash256, generate_transition_parameters, get_interface, outr_value_to_str, parse_amount, run_script};
+use crate::scripts::{add_transition_states, generate_transition_parameters, get_interface, run_script_with_contract_state};
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct TxParams {
@@ -435,11 +429,15 @@ fn build_main_transition<S: StashProvider, H: StateProvider, I: IndexProvider>(
                     // run the transition bizlogic
                     // let bl_transition_validator = bl_transition_details.transition_schema.validator.unwrap();
                     let pos = transition_script.get("position").unwrap().as_u64().unwrap() as u16;
-                    let outputs = run_script(
+                    let contract = stock
+                        .contract_data(context.contract_id)
+                        .map_err(|e| e.to_string())?;
+                    let outputs = run_script_with_contract_state(
                         &consignment,
                         interface_libid,
                         pos,
-                        script_params
+                        script_params,
+                        contract.state,
                     )?;
                     if outputs.len() < 2 {
                         return Err(CompositionError::Unexpected(
