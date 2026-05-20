@@ -1833,7 +1833,7 @@ dependencies = [
 
 [[package]]
 name = "rgb-api"
-version = "0.11.1-rc.8"
+version = "0.11.1-rc.10"
 dependencies = [
  "amplify",
  "baid64",
@@ -1874,7 +1874,7 @@ dependencies = [
 
 [[package]]
 name = "rgb-cmd"
-version = "0.11.1-rc.8"
+version = "0.11.1-rc.10"
 dependencies = [
  "amplify",
  "baid64",
@@ -1965,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "rgb-psbt-utils"
-version = "0.11.1-rc.8"
+version = "0.11.1-rc.10"
 dependencies = [
  "amplify",
  "baid64",
