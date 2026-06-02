@@ -103,7 +103,6 @@ pub fn run_script_with_contract_state<const TRANSFER: bool, M: ContractStateAcce
     let mut vm = Vm::<Instr<RgbIsa<M>>>::new();
     vm.registers.set_outstack_limit(1024);
     for param in params {
-        println!("**************** param: {:?}", param);
         match param.reg_name.as_str() {
             "a64" => {
                 let _ = vm.registers.set_a64(
@@ -702,7 +701,6 @@ pub fn add_transition_states<const TRANSFER: bool>(
     let mut j  = 0;
     for (i, value) in abi.iter().enumerate() {
         let outr_value = &outputs[j];
-        println!("**************** index: {j}, outr_value: {:?}", outr_value);
         j = j + 1;
         let abi_name = value
             .get("name")
