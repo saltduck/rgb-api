@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use psrgbt::{RgbOutExt, RgbPropKeyExt, RgbPsbtExt};
 use rgbstd::containers::{Batch, BuilderSeal, Transfer};
@@ -19,8 +19,8 @@ use crate::pay::{
     apply_transition_schema_globals_from_contract_state, build_extra_transitions, PsbtMeta,
 };
 use crate::scripts::{
-    add_transition_states_with_terminals, generate_transition_parameters_from_args, get_interface,
-    main_assignment_type_from_returns_abi, run_script_with_contract_state,
+    add_transition_states_with_terminal_vouts, generate_transition_parameters_from_args,
+    get_interface, main_assignment_type_from_returns_abi, run_script_with_contract_state,
     TransitionTerminalOutputs,
 };
 use crate::{CompositionError, WalletError};
@@ -29,6 +29,7 @@ use crate::{CompositionError, WalletError};
 pub struct MultipartyTransitionInput {
     pub seal: OutputSeal,
     pub expected_assignments: Vec<(AssignmentType, AllocatedState)>,
+    pub owner_id: Option<String>,
 }
 
 impl MultipartyTransitionInput {
@@ -36,6 +37,7 @@ impl MultipartyTransitionInput {
         Self {
             seal,
             expected_assignments: vec![],
+            owner_id: None,
         }
     }
 
@@ -46,7 +48,13 @@ impl MultipartyTransitionInput {
         Self {
             seal,
             expected_assignments,
+            owner_id: None,
         }
+    }
+
+    pub fn with_owner(mut self, owner_id: impl Into<String>) -> Self {
+        self.owner_id = Some(owner_id.into());
+        self
     }
 }
 
@@ -56,6 +64,10 @@ pub struct MultipartyOutputPlan {
     pub change_vout: Option<u32>,
     pub carrier_vout: u32,
     pub additional_terminal_vouts: BTreeSet<u32>,
+    pub change_vouts_by_owner: BTreeMap<String, u32>,
+    pub terminal_vouts: BTreeMap<String, u32>,
+    pub assignment_terminal_map: BTreeMap<AssignmentTerminalRef, String>,
+    pub require_distinct_owner_change_vouts: bool,
 }
 
 impl MultipartyOutputPlan {
@@ -65,7 +77,36 @@ impl MultipartyOutputPlan {
             change_vout,
             carrier_vout,
             additional_terminal_vouts: BTreeSet::new(),
+            change_vouts_by_owner: BTreeMap::new(),
+            terminal_vouts: BTreeMap::new(),
+            assignment_terminal_map: BTreeMap::new(),
+            require_distinct_owner_change_vouts: false,
         }
+    }
+
+    pub fn with_owner_change_vout(mut self, owner_id: impl Into<String>, vout: u32) -> Self {
+        self.change_vouts_by_owner.insert(owner_id.into(), vout);
+        self
+    }
+
+    pub fn with_terminal_vout(mut self, terminal_id: impl Into<String>, vout: u32) -> Self {
+        self.terminal_vouts.insert(terminal_id.into(), vout);
+        self
+    }
+
+    pub fn with_assignment_terminal(
+        mut self,
+        assignment: AssignmentTerminalRef,
+        terminal_id: impl Into<String>,
+    ) -> Self {
+        self.assignment_terminal_map
+            .insert(assignment, terminal_id.into());
+        self
+    }
+
+    pub fn require_distinct_owner_change_vouts(mut self) -> Self {
+        self.require_distinct_owner_change_vouts = true;
+        self
     }
 }
 
@@ -79,13 +120,59 @@ pub struct MultipartyTransitionPlan {
     pub outputs: MultipartyOutputPlan,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AssignmentTerminalRef {
+    pub abi_name: String,
+    pub occurrence: usize,
+}
+
+impl AssignmentTerminalRef {
+    pub fn new(abi_name: impl Into<String>, occurrence: usize) -> Self {
+        Self {
+            abi_name: abi_name.into(),
+            occurrence,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LateBoundArg {
+    FinalTxOutpoint { vout: u32 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultipartyAdvancedTransitionPlan {
+    pub base: MultipartyTransitionPlan,
+    pub late_bound_args: BTreeMap<String, LateBoundArg>,
+}
+
+impl MultipartyAdvancedTransitionPlan {
+    pub fn new(base: MultipartyTransitionPlan) -> Self {
+        Self {
+            base,
+            late_bound_args: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_late_bound_arg(mut self, name: impl Into<String>, arg: LateBoundArg) -> Self {
+        self.late_bound_args.insert(name.into(), arg);
+        self
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MultipartyTransitionResult {
     pub meta: PsbtMeta,
     pub witness_id: Txid,
+    pub commitment_txid: Txid,
     pub transition_id: OpId,
     pub transfer: Transfer,
     pub terminal_outputs: Vec<OutputSeal>,
+}
+
+struct MultipartyBuildOutput {
+    result: Option<MultipartyTransitionResult>,
+    commitment_txid: Txid,
 }
 
 struct MultipartyFasciaResolver {
@@ -112,11 +199,96 @@ pub fn build_transition_on_psbt<
     psbt: &mut Psbt,
     plan: &MultipartyTransitionPlan,
 ) -> Result<MultipartyTransitionResult, WalletError> {
+    let advanced = MultipartyAdvancedTransitionPlan::new(plan.clone());
+    build_transition_on_psbt_inner::<S, H, I, P, O, Psbt>(stock, psbt, &advanced, None, false)?
+        .result
+        .ok_or_else(|| WalletError::Custom("internal multiparty build returned no result".into()))
+}
+
+#[allow(clippy::result_large_err)]
+pub fn build_advanced_transition_on_psbt<
+    S: StashProvider,
+    H: StateProvider,
+    I: IndexProvider,
+    P: RgbPropKeyExt,
+    O: RgbOutExt<P>,
+    Psbt: RgbPsbtExt<P, O> + Clone,
+>(
+    stock: &mut Stock<S, H, I>,
+    psbt: &mut Psbt,
+    plan: &MultipartyAdvancedTransitionPlan,
+) -> Result<MultipartyTransitionResult, WalletError> {
+    if plan.late_bound_args.is_empty() {
+        return build_transition_on_psbt_inner::<S, H, I, P, O, Psbt>(
+            stock, psbt, plan, None, false,
+        )?
+        .result
+        .ok_or_else(|| WalletError::Custom("internal multiparty build returned no result".into()));
+    }
+
+    let mut probe_plan = plan.clone();
+    probe_plan.base.args = resolve_late_bound_args(
+        &probe_plan.base.args,
+        &probe_plan.late_bound_args,
+        psbt.get_txid(),
+    )?;
+    let mut probe_psbt = psbt.clone();
+    let probe_result = build_transition_on_psbt_inner::<S, H, I, P, O, Psbt>(
+        stock,
+        &mut probe_psbt,
+        &probe_plan,
+        None,
+        true,
+    )?;
+
+    let final_args = resolve_late_bound_args(
+        &plan.base.args,
+        &plan.late_bound_args,
+        probe_result.commitment_txid,
+    )?;
+    let mut final_plan = plan.clone();
+    final_plan.base.args = final_args;
+
+    let result = build_transition_on_psbt_inner::<S, H, I, P, O, Psbt>(
+        stock,
+        psbt,
+        &final_plan,
+        Some(probe_result.commitment_txid),
+        false,
+    )?;
+    if result.commitment_txid != probe_result.commitment_txid {
+        return Err(WalletError::Custom(format!(
+            "late-bound transition args changed commitment txid: probe={}, final={}",
+            probe_result.commitment_txid, result.commitment_txid
+        )));
+    }
+    result
+        .result
+        .ok_or_else(|| WalletError::Custom("internal multiparty build returned no result".into()))
+}
+
+#[allow(clippy::result_large_err)]
+fn build_transition_on_psbt_inner<
+    S: StashProvider,
+    H: StateProvider,
+    I: IndexProvider,
+    P: RgbPropKeyExt,
+    O: RgbOutExt<P>,
+    Psbt: RgbPsbtExt<P, O>,
+>(
+    stock: &mut Stock<S, H, I>,
+    psbt: &mut Psbt,
+    advanced_plan: &MultipartyAdvancedTransitionPlan,
+    expected_commitment_txid: Option<Txid>,
+    probe_only: bool,
+) -> Result<MultipartyBuildOutput, WalletError> {
+    let plan = &advanced_plan.base;
     if plan.inputs.is_empty() {
         return Err(WalletError::Custom(
             "multiparty transition requires at least one explicit RGB input".to_string(),
         ));
     }
+    validate_multiparty_output_plan(plan)?;
 
     let meta = PsbtMeta {
         beneficiary_vout: plan.outputs.beneficiary_vout,
@@ -209,16 +381,23 @@ pub fn build_transition_on_psbt<
 
     for (seal, list) in assignments {
         assert_expected_assignments(seal, &list, expected_by_seal.get(&seal))?;
+        let owner_id = plan
+            .inputs
+            .iter()
+            .find(|input| input.seal == seal)
+            .and_then(|input| input.owner_id.as_deref());
         for (opout, state) in list {
             main_builder = main_builder.add_input(opout, state.clone())?;
             *input_type_counts.entry(opout.ty).or_insert(0) += 1;
             if opout.ty != main_assignment_type {
-                let seal = change_seal(opout.ty, &meta).map_err(|e| e.to_string())?;
+                let seal = owner_change_seal(opout.ty, &meta, &plan.outputs, owner_id)
+                    .map_err(|e| e.to_string())?;
                 main_builder = main_builder.add_owned_state_raw(opout.ty, seal, state)?;
             } else if let AllocatedState::Amount(value) = state {
                 sum_inputs += Amount::from(value);
             } else {
-                let seal = change_seal(opout.ty, &meta).map_err(|e| e.to_string())?;
+                let seal = owner_change_seal(opout.ty, &meta, &plan.outputs, owner_id)
+                    .map_err(|e| e.to_string())?;
                 main_builder = main_builder.add_owned_state_raw(opout.ty, seal, state)?;
             }
         }
@@ -265,7 +444,8 @@ pub fn build_transition_on_psbt<
         .beneficiary_vout
         .map(|vout| BuilderSeal::Revealed(GraphSeal::with_blinded_vout(vout, rand::random())));
     let ben_seal = beneficiary_seal.as_ref().unwrap_or(&change_seal);
-    let (mut main_builder, terminal_outputs) = add_transition_states_with_terminals(
+    let terminal_vouts_by_assignment = terminal_vouts_by_assignment(&plan.outputs);
+    let (mut main_builder, terminal_outputs) = add_transition_states_with_terminal_vouts(
         &export,
         abi,
         &outputs,
@@ -274,6 +454,7 @@ pub fn build_transition_on_psbt<
         &change_seal,
         plan.outputs.beneficiary_vout,
         plan.outputs.change_vout,
+        (!terminal_vouts_by_assignment.is_empty()).then_some(&terminal_vouts_by_assignment),
     )
     .map_err(|e| e.to_string())?;
 
@@ -307,6 +488,20 @@ pub fn build_transition_on_psbt<
 
     let fascia = psbt.rgb_commit().map_err(|e| e.to_string())?;
     let witness_id = psbt.get_txid();
+    if let Some(expected) = expected_commitment_txid {
+        if witness_id != expected {
+            return Err(WalletError::Custom(format!(
+                "late-bound transition args resolved against txid {}, but final commitment txid is {}",
+                expected, witness_id
+            )));
+        }
+    }
+    if probe_only {
+        return Ok(MultipartyBuildOutput {
+            result: None,
+            commitment_txid: witness_id,
+        });
+    }
     stock
         .consume_fascia(fascia, MultipartyFasciaResolver { witness_id })
         .map_err(|e| e.to_string())?;
@@ -322,12 +517,16 @@ pub fn build_transition_on_psbt<
         .transfer(plan.contract_id, &transfer_output_seals, vec![], [], Some(witness_id))
         .map_err(|e| e.to_string())?;
 
-    Ok(MultipartyTransitionResult {
-        meta,
-        witness_id,
-        transition_id,
-        transfer,
-        terminal_outputs: transfer_output_seals,
+    Ok(MultipartyBuildOutput {
+        commitment_txid: witness_id,
+        result: Some(MultipartyTransitionResult {
+            meta,
+            witness_id,
+            commitment_txid: witness_id,
+            transition_id,
+            transfer,
+            terminal_outputs: transfer_output_seals,
+        }),
     })
 }
 
@@ -402,6 +601,118 @@ fn change_seal(
         .change_vout
         .ok_or(CompositionError::NoExtraOrChange(assignment_type))?;
     Ok(BuilderSeal::Revealed(GraphSeal::with_blinded_vout(vout, rand::random())))
+}
+
+fn owner_change_seal(
+    assignment_type: AssignmentType,
+    meta: &PsbtMeta,
+    outputs: &MultipartyOutputPlan,
+    owner_id: Option<&str>,
+) -> Result<BuilderSeal<GraphSeal>, CompositionError> {
+    if let Some(owner_id) = owner_id {
+        if let Some(vout) = outputs.change_vouts_by_owner.get(owner_id) {
+            return Ok(BuilderSeal::Revealed(GraphSeal::with_blinded_vout(*vout, rand::random())));
+        }
+        if !outputs.change_vouts_by_owner.is_empty() {
+            return Err(CompositionError::Unexpected(format!(
+                "missing RGB change vout for owner '{owner_id}'"
+            )));
+        }
+    } else if !outputs.change_vouts_by_owner.is_empty() {
+        return Err(CompositionError::Unexpected(
+            "multiparty owner change vouts require every RGB input to declare owner_id".into(),
+        ));
+    }
+    change_seal(assignment_type, meta)
+}
+
+fn validate_multiparty_output_plan(plan: &MultipartyTransitionPlan) -> Result<(), WalletError> {
+    let outputs = &plan.outputs;
+    if !outputs.change_vouts_by_owner.is_empty() {
+        let mut owners = HashSet::<&str>::new();
+        for input in &plan.inputs {
+            let Some(owner_id) = input.owner_id.as_deref() else {
+                return Err(WalletError::Custom(
+                    "multiparty owner change vouts require every RGB input to declare owner_id"
+                        .into(),
+                ));
+            };
+            owners.insert(owner_id);
+            if !outputs.change_vouts_by_owner.contains_key(owner_id) {
+                return Err(WalletError::Custom(format!(
+                    "missing RGB change vout for owner '{owner_id}'"
+                )));
+            }
+        }
+        for owner_id in outputs.change_vouts_by_owner.keys() {
+            if !owners.contains(owner_id.as_str()) {
+                return Err(WalletError::Custom(format!(
+                    "change_vouts_by_owner contains unknown owner '{owner_id}'"
+                )));
+            }
+        }
+        if outputs.require_distinct_owner_change_vouts {
+            let unique = outputs
+                .change_vouts_by_owner
+                .values()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if unique.len() != outputs.change_vouts_by_owner.len() {
+                return Err(WalletError::Custom("owner RGB change vouts must be distinct".into()));
+            }
+        }
+    }
+    for (assignment, terminal_id) in &outputs.assignment_terminal_map {
+        if !outputs.terminal_vouts.contains_key(terminal_id) {
+            return Err(WalletError::Custom(format!(
+                "assignment terminal {}#{} references unknown terminal '{terminal_id}'",
+                assignment.abi_name, assignment.occurrence
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn terminal_vouts_by_assignment(outputs: &MultipartyOutputPlan) -> BTreeMap<(String, usize), u32> {
+    outputs
+        .assignment_terminal_map
+        .iter()
+        .filter_map(|(assignment, terminal_id)| {
+            outputs
+                .terminal_vouts
+                .get(terminal_id)
+                .map(|vout| ((assignment.abi_name.clone(), assignment.occurrence), *vout))
+        })
+        .collect()
+}
+
+fn resolve_late_bound_args(
+    args: &[(String, String)],
+    late_bound_args: &BTreeMap<String, LateBoundArg>,
+    txid: Txid,
+) -> Result<Vec<(String, String)>, WalletError> {
+    if late_bound_args.is_empty() {
+        return Ok(args.to_vec());
+    }
+    let mut resolved = args.to_vec();
+    let mut seen = HashSet::<&str>::new();
+    for (name, _) in args {
+        if late_bound_args.contains_key(name) {
+            seen.insert(name.as_str());
+        }
+    }
+    for (name, late) in late_bound_args {
+        let value = match late {
+            LateBoundArg::FinalTxOutpoint { vout } => format!("{txid}:{vout}"),
+        };
+        if let Some((_, existing)) = resolved.iter_mut().find(|(arg_name, _)| arg_name == name) {
+            *existing = value;
+        } else {
+            resolved.push((name.clone(), value));
+        }
+        seen.insert(name.as_str());
+    }
+    Ok(resolved)
 }
 
 fn terminal_seeds(
@@ -679,5 +990,108 @@ mod tests {
 
         assert!(err.to_string().contains("different output"));
         assert!(!psbt.outputs[1].opret_host);
+    }
+
+    #[test]
+    fn legacy_single_change_output_plan_defaults_remain_compatible() {
+        let plan = MultipartyOutputPlan::new(Some(0), Some(1), 2);
+
+        assert_eq!(plan.beneficiary_vout, Some(0));
+        assert_eq!(plan.change_vout, Some(1));
+        assert_eq!(plan.carrier_vout, 2);
+        assert!(plan.change_vouts_by_owner.is_empty());
+        assert!(plan.terminal_vouts.is_empty());
+        assert!(plan.assignment_terminal_map.is_empty());
+    }
+
+    #[test]
+    fn owner_change_vouts_must_have_owner_mapping_for_each_input() {
+        let mut output_plan = MultipartyOutputPlan::new(Some(0), Some(1), 3);
+        output_plan
+            .change_vouts_by_owner
+            .insert("alice".to_string(), 1);
+        let plan =
+            dummy_plan(output_plan, vec![dummy_input(0).with_owner("alice"), dummy_input(1)]);
+
+        let err = validate_multiparty_output_plan(&plan).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("every RGB input to declare owner_id"));
+    }
+
+    #[test]
+    fn owner_change_vouts_can_require_distinct_seals() {
+        let output_plan = MultipartyOutputPlan::new(Some(0), None, 4)
+            .with_owner_change_vout("alice", 1)
+            .with_owner_change_vout("bob", 1)
+            .require_distinct_owner_change_vouts();
+        let plan = dummy_plan(
+            output_plan,
+            vec![dummy_input(0).with_owner("alice"), dummy_input(1).with_owner("bob")],
+        );
+
+        let err = validate_multiparty_output_plan(&plan).unwrap_err();
+
+        assert!(err.to_string().contains("must be distinct"));
+    }
+
+    #[test]
+    fn same_name_change_returns_can_map_to_distinct_terminals() {
+        let output_plan = MultipartyOutputPlan::new(Some(0), Some(1), 4)
+            .with_terminal_vout("alice_change", 1)
+            .with_terminal_vout("bob_change", 2)
+            .with_assignment_terminal(AssignmentTerminalRef::new("change", 0), "alice_change")
+            .with_assignment_terminal(AssignmentTerminalRef::new("change", 1), "bob_change");
+
+        let map = terminal_vouts_by_assignment(&output_plan);
+
+        assert_eq!(map.get(&("change".to_string(), 0)), Some(&1));
+        assert_eq!(map.get(&("change".to_string(), 1)), Some(&2));
+    }
+
+    #[test]
+    fn terminal_mapping_must_reference_known_terminal() {
+        let output_plan = MultipartyOutputPlan::new(Some(0), Some(1), 4)
+            .with_assignment_terminal(AssignmentTerminalRef::new("change", 0), "missing");
+        let plan = dummy_plan(output_plan, vec![dummy_input(0)]);
+
+        let err = validate_multiparty_output_plan(&plan).unwrap_err();
+
+        assert!(err.to_string().contains("unknown terminal"));
+    }
+
+    #[test]
+    fn late_bound_final_tx_outpoint_overrides_arg_with_commitment_txid() {
+        let txid = dummy_txid(9);
+        let args = vec![("settler".to_string(), "placeholder".to_string())];
+        let late =
+            BTreeMap::from([("settler".to_string(), LateBoundArg::FinalTxOutpoint { vout: 7 })]);
+
+        let resolved = resolve_late_bound_args(&args, &late, txid).unwrap();
+
+        assert_eq!(resolved, vec![("settler".to_string(), format!("{txid}:7"))]);
+    }
+
+    fn dummy_plan(
+        outputs: MultipartyOutputPlan,
+        inputs: Vec<MultipartyTransitionInput>,
+    ) -> MultipartyTransitionPlan {
+        MultipartyTransitionPlan {
+            contract_id: ContractId::copy_from_slice(&[1u8; 32]).unwrap(),
+            transition_name: "demo".to_string(),
+            args: vec![],
+            inputs,
+            close_method: CloseMethod::OpretFirst,
+            outputs,
+        }
+    }
+
+    fn dummy_input(vout: u32) -> MultipartyTransitionInput {
+        MultipartyTransitionInput::new(OutputSeal::new(rgbstd::Outpoint::new(dummy_txid(1), vout)))
+    }
+
+    fn dummy_txid(byte: u8) -> Txid {
+        format!("{byte:02x}").repeat(32).parse().unwrap()
     }
 }

@@ -731,13 +731,39 @@ pub fn add_transition_states_with_terminals<const TRANSFER: bool>(
     consignment: &Consignment<TRANSFER>,
     abi: &Vec<serde_json::Value>,
     outputs: &Vec<OutrValue>,
-    mut main_builder: TransitionBuilder,
+    main_builder: TransitionBuilder,
     beneficiary_seal: &BuilderSeal<GraphSeal>,
     change_seal: &BuilderSeal<GraphSeal>,
     beneficiary_vout: Option<u32>,
     change_vout: Option<u32>,
 ) -> Result<(TransitionBuilder, TransitionTerminalOutputs), CompositionError> {
+    add_transition_states_with_terminal_vouts(
+        consignment,
+        abi,
+        outputs,
+        main_builder,
+        beneficiary_seal,
+        change_seal,
+        beneficiary_vout,
+        change_vout,
+        None,
+    )
+}
+
+pub fn add_transition_states_with_terminal_vouts<const TRANSFER: bool>(
+    consignment: &Consignment<TRANSFER>,
+    abi: &Vec<serde_json::Value>,
+    outputs: &Vec<OutrValue>,
+    mut main_builder: TransitionBuilder,
+    beneficiary_seal: &BuilderSeal<GraphSeal>,
+    change_seal: &BuilderSeal<GraphSeal>,
+    beneficiary_vout: Option<u32>,
+    change_vout: Option<u32>,
+    terminal_vouts_by_assignment: Option<&BTreeMap<(String, usize), u32>>,
+) -> Result<(TransitionBuilder, TransitionTerminalOutputs), CompositionError> {
     let mut terminals = TransitionTerminalOutputs::default();
+    let mut used_terminal_assignments = BTreeSet::<(String, usize)>::new();
+    let mut assignment_occurrences = BTreeMap::<String, usize>::new();
     let mut j  = 0;
     for (i, value) in abi.iter().enumerate() {
         let outr_value = &outputs[j];
@@ -761,6 +787,9 @@ pub fn add_transition_states_with_terminals<const TRANSFER: bool>(
             ))
         })?;
         let abi_type = AssignmentType::from(type_raw as u16);
+        let occurrence = assignment_occurrences.entry(abi_name.to_owned()).or_insert(0);
+        let assignment_key = (abi_name.to_owned(), *occurrence);
+        *occurrence += 1;
 
         match abi_name {
             "benifery" => {
@@ -771,12 +800,19 @@ pub fn add_transition_states_with_terminals<const TRANSFER: bool>(
                 }
                 let received = parse_amount(outr_value)?;
                 if received > Amount::ZERO {
+                    let (seal, vout) = assignment_terminal_seal(
+                        beneficiary_seal,
+                        beneficiary_vout,
+                        terminal_vouts_by_assignment,
+                        &assignment_key,
+                        &mut used_terminal_assignments,
+                    );
                     main_builder = main_builder.add_fungible_state_raw(
                         abi_type,
-                        beneficiary_seal.clone(),
+                        seal,
                         received,
                     )?;
-                    if let Some(vout) = beneficiary_vout {
+                    if let Some(vout) = vout {
                         terminals.push_witness_vout(vout);
                     }
                 }
@@ -785,12 +821,19 @@ pub fn add_transition_states_with_terminals<const TRANSFER: bool>(
                 "a64" => {
                     let change = parse_amount(outr_value)?;
                     if change > Amount::ZERO {
+                        let (seal, vout) = assignment_terminal_seal(
+                            change_seal,
+                            change_vout,
+                            terminal_vouts_by_assignment,
+                            &assignment_key,
+                            &mut used_terminal_assignments,
+                        );
                         main_builder = main_builder.add_fungible_state_raw(
                             abi_type,
-                            change_seal.clone(),
+                            seal,
                             change,
                         )?;
-                        if let Some(vout) = change_vout {
+                        if let Some(vout) = vout {
                             terminals.push_witness_vout(vout);
                         }
                     }
@@ -800,12 +843,19 @@ pub fn add_transition_states_with_terminals<const TRANSFER: bool>(
                     let payload = Confined::try_from_iter(hash.iter().copied()).map_err(|e| {
                         CompositionError::Unexpected(format!("OS_HASH RevealedData: {e}"))
                     })?;
+                    let (seal, vout) = assignment_terminal_seal(
+                        change_seal,
+                        change_vout,
+                        terminal_vouts_by_assignment,
+                        &assignment_key,
+                        &mut used_terminal_assignments,
+                    );
                     main_builder = main_builder.add_data_raw(
                         abi_type,
-                        change_seal.clone(),
+                        seal,
                         RevealedData::new(payload),
                     )?;
-                    if let Some(vout) = change_vout {
+                    if let Some(vout) = vout {
                         terminals.push_witness_vout(vout);
                     }
                 }
@@ -814,25 +864,39 @@ pub fn add_transition_states_with_terminals<const TRANSFER: bool>(
                     let payload = Confined::try_from_iter(raw.into_iter()).map_err(|e| {
                         CompositionError::Unexpected(format!("OS_OUTPOINT RevealedData: {e}"))
                     })?;
+                    let (seal, vout) = assignment_terminal_seal(
+                        change_seal,
+                        change_vout,
+                        terminal_vouts_by_assignment,
+                        &assignment_key,
+                        &mut used_terminal_assignments,
+                    );
                     main_builder = main_builder.add_data_raw(
                         abi_type,
-                        change_seal.clone(),
+                        seal,
                         RevealedData::new(payload),
                     )?;
-                    if let Some(vout) = change_vout {
+                    if let Some(vout) = vout {
                         terminals.push_witness_vout(vout);
                     }
                 }
                 "s16" => {
                     let data = parse_s16_payload(consignment, abi_type, outr_value)?;
+                    let (seal, vout) = assignment_terminal_seal(
+                        change_seal,
+                        change_vout,
+                        terminal_vouts_by_assignment,
+                        &assignment_key,
+                        &mut used_terminal_assignments,
+                    );
                     main_builder = main_builder.add_data_raw(
                         abi_type,
-                        change_seal.clone(),
+                        seal,
                         RevealedData::new(Confined::try_from(data).map_err(|e| {
                             CompositionError::Unexpected(format!("String RevealedData: {e}"))
                         })?),
                     )?;
-                    if let Some(vout) = change_vout {
+                    if let Some(vout) = vout {
                         terminals.push_witness_vout(vout);
                     }
                 }
@@ -936,7 +1000,35 @@ pub fn add_transition_states_with_terminals<const TRANSFER: bool>(
             }
         }
     }
+    if let Some(map) = terminal_vouts_by_assignment {
+        for key in map.keys() {
+            if !used_terminal_assignments.contains(key) {
+                return Err(CompositionError::Unexpected(format!(
+                    "terminal mapping for ABI return '{}#{}' did not match any produced assignment",
+                    key.0, key.1
+                )));
+            }
+        }
+    }
     Ok((main_builder, terminals))
+}
+
+fn assignment_terminal_seal(
+    default_seal: &BuilderSeal<GraphSeal>,
+    default_vout: Option<u32>,
+    terminal_vouts_by_assignment: Option<&BTreeMap<(String, usize), u32>>,
+    assignment_key: &(String, usize),
+    used_terminal_assignments: &mut BTreeSet<(String, usize)>,
+) -> (BuilderSeal<GraphSeal>, Option<u32>) {
+    if let Some(vout) = terminal_vouts_by_assignment.and_then(|map| map.get(assignment_key)) {
+        used_terminal_assignments.insert(assignment_key.clone());
+        (
+            BuilderSeal::Revealed(GraphSeal::with_blinded_vout(*vout, rand::random())),
+            Some(*vout),
+        )
+    } else {
+        (default_seal.clone(), default_vout)
+    }
 }
 
 /// Extension trait: call `validate_ext` after `use ...::ConsignmentValidateExt`.

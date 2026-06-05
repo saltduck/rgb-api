@@ -42,8 +42,9 @@ pub use descriptor::bp_wallet_integration;
 pub use descriptor::{DescriptorRgb, RgbDescr, TapretKey, WpkhDescr};
 pub use errors::{CompletionError, CompositionError, PayError, WalletError};
 pub use multiparty::{
-    build_transition_on_psbt, MultipartyOutputPlan, MultipartyTransitionInput,
-    MultipartyTransitionPlan, MultipartyTransitionResult,
+    build_advanced_transition_on_psbt, build_transition_on_psbt, AssignmentTerminalRef,
+    LateBoundArg, MultipartyAdvancedTransitionPlan, MultipartyOutputPlan,
+    MultipartyTransitionInput, MultipartyTransitionPlan, MultipartyTransitionResult,
 };
 pub use pay::{
     apply_transition_schema_globals_from_contract_state, build_extra_transitions,
