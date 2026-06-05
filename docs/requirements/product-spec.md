@@ -8,47 +8,55 @@ The legacy multiparty transition API remains valid:
   continues to bind all `"change"` ABI returns to the single `change_vout`.
 - Existing callers can keep using `build_transition_on_psbt`.
 
-The extended API adds:
+The extended API adds sidecar declarations on `MultipartyAdvancedTransitionPlan`:
 
-- `MultipartyTransitionInput::with_owner(owner_id)` for input ownership;
-- `change_vouts_by_owner` on `MultipartyOutputPlan` for participant RGB change;
-- `terminal_vouts` and `assignment_terminal_map` for ABI return to terminal
-  binding, including repeated return names such as `change#0` and `change#1`;
-- `MultipartyAdvancedTransitionPlan` with `LateBoundArg::FinalTxOutpoint` for
-  arguments that must be resolved from the RGB commitment txid.
+- `with_input_owner(seal, owner_id)` for input ownership;
+- `with_owner_change_vout(owner_id, vout)` for participant RGB change;
+- `with_terminal_vout` and `with_assignment_terminal` for ABI return to
+  terminal binding, including repeated return names such as `change#0` and
+  `change#1`;
+- `with_late_bound_arg(name, LateBoundArg::FinalTxOutpoint)` for arguments that
+  must be resolved from the RGB commitment txid.
 
-Late-bound construction uses a cloned PSBT probe to calculate the commitment
-txid without consuming stock state, then rebuilds the final transition using
-that txid. If the final commitment txid differs, construction fails.
+Late-bound construction uses cloned PSBT probes to look for a stable commitment
+txid without consuming stock state. The final transition is committed to the
+caller-provided PSBT only after the resolved args and RGB commitment txid
+converge. If they do not converge, construction fails and the original PSBT is
+left unchanged.
 
 Example shape:
 
 ```rust
-let outputs = MultipartyOutputPlan::new(Some(0), None, 4)
-    .with_owner_change_vout("alice", 1)
-    .with_owner_change_vout("bob", 2)
-    .require_distinct_owner_change_vouts()
-    .with_terminal_vout("alice_change", 1)
-    .with_terminal_vout("bob_change", 2)
-    .with_assignment_terminal(AssignmentTerminalRef::new("change", 0), "alice_change")
-    .with_assignment_terminal(AssignmentTerminalRef::new("change", 1), "bob_change");
+let outputs = MultipartyOutputPlan::new(Some(0), None, 4);
 
 let base = MultipartyTransitionPlan {
     contract_id,
     transition_name: "demo".to_owned(),
     args: vec![("settler".to_owned(), "placeholder".to_owned())],
     inputs: vec![
-        MultipartyTransitionInput::new(alice_seal).with_owner("alice"),
-        MultipartyTransitionInput::new(bob_seal).with_owner("bob"),
+        MultipartyTransitionInput::new(alice_seal),
+        MultipartyTransitionInput::new(bob_seal),
     ],
     close_method,
     outputs,
 };
 
 let plan = MultipartyAdvancedTransitionPlan::new(base)
+    .with_input_owner(alice_seal, "alice")
+    .with_input_owner(bob_seal, "bob")
+    .with_owner_change_vout("alice", 1)
+    .with_owner_change_vout("bob", 2)
+    .require_distinct_owner_change_vouts()
+    .with_terminal_vout("alice_change", 1)
+    .with_terminal_vout("bob_change", 2)
+    .with_assignment_terminal(AssignmentTerminalRef::new("change", 0), "alice_change")
+    .with_assignment_terminal(AssignmentTerminalRef::new("change", 1), "bob_change")
     .with_late_bound_arg("settler", LateBoundArg::FinalTxOutpoint { vout: 0 });
 
 let result = build_advanced_transition_on_psbt(stock, psbt, &plan)?;
 assert_eq!(result.witness_id, result.commitment_txid);
 ```
 
+Self-referential transition scripts where the final txid argument changes the
+same RGB commitment that determines that txid may not converge. Those plans must
+fail closed instead of binding to a non-stable txid.

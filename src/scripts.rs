@@ -742,8 +742,8 @@ pub fn add_transition_states_with_terminals<const TRANSFER: bool>(
         abi,
         outputs,
         main_builder,
-        beneficiary_seal,
-        change_seal,
+        Some(beneficiary_seal),
+        Some(change_seal),
         beneficiary_vout,
         change_vout,
         None,
@@ -755,11 +755,11 @@ pub fn add_transition_states_with_terminal_vouts<const TRANSFER: bool>(
     abi: &Vec<serde_json::Value>,
     outputs: &Vec<OutrValue>,
     mut main_builder: TransitionBuilder,
-    beneficiary_seal: &BuilderSeal<GraphSeal>,
-    change_seal: &BuilderSeal<GraphSeal>,
+    beneficiary_seal: Option<&BuilderSeal<GraphSeal>>,
+    change_seal: Option<&BuilderSeal<GraphSeal>>,
     beneficiary_vout: Option<u32>,
     change_vout: Option<u32>,
-    terminal_vouts_by_assignment: Option<&BTreeMap<(String, usize), u32>>,
+    terminal_seals_by_assignment: Option<&BTreeMap<(String, usize), (BuilderSeal<GraphSeal>, u32)>>,
 ) -> Result<(TransitionBuilder, TransitionTerminalOutputs), CompositionError> {
     let mut terminals = TransitionTerminalOutputs::default();
     let mut used_terminal_assignments = BTreeSet::<(String, usize)>::new();
@@ -803,10 +803,10 @@ pub fn add_transition_states_with_terminal_vouts<const TRANSFER: bool>(
                     let (seal, vout) = assignment_terminal_seal(
                         beneficiary_seal,
                         beneficiary_vout,
-                        terminal_vouts_by_assignment,
+                        terminal_seals_by_assignment,
                         &assignment_key,
                         &mut used_terminal_assignments,
-                    );
+                    )?;
                     main_builder = main_builder.add_fungible_state_raw(
                         abi_type,
                         seal,
@@ -824,10 +824,10 @@ pub fn add_transition_states_with_terminal_vouts<const TRANSFER: bool>(
                         let (seal, vout) = assignment_terminal_seal(
                             change_seal,
                             change_vout,
-                            terminal_vouts_by_assignment,
+                            terminal_seals_by_assignment,
                             &assignment_key,
                             &mut used_terminal_assignments,
-                        );
+                        )?;
                         main_builder = main_builder.add_fungible_state_raw(
                             abi_type,
                             seal,
@@ -846,10 +846,10 @@ pub fn add_transition_states_with_terminal_vouts<const TRANSFER: bool>(
                     let (seal, vout) = assignment_terminal_seal(
                         change_seal,
                         change_vout,
-                        terminal_vouts_by_assignment,
+                        terminal_seals_by_assignment,
                         &assignment_key,
                         &mut used_terminal_assignments,
-                    );
+                    )?;
                     main_builder = main_builder.add_data_raw(
                         abi_type,
                         seal,
@@ -867,10 +867,10 @@ pub fn add_transition_states_with_terminal_vouts<const TRANSFER: bool>(
                     let (seal, vout) = assignment_terminal_seal(
                         change_seal,
                         change_vout,
-                        terminal_vouts_by_assignment,
+                        terminal_seals_by_assignment,
                         &assignment_key,
                         &mut used_terminal_assignments,
-                    );
+                    )?;
                     main_builder = main_builder.add_data_raw(
                         abi_type,
                         seal,
@@ -885,10 +885,10 @@ pub fn add_transition_states_with_terminal_vouts<const TRANSFER: bool>(
                     let (seal, vout) = assignment_terminal_seal(
                         change_seal,
                         change_vout,
-                        terminal_vouts_by_assignment,
+                        terminal_seals_by_assignment,
                         &assignment_key,
                         &mut used_terminal_assignments,
-                    );
+                    )?;
                     main_builder = main_builder.add_data_raw(
                         abi_type,
                         seal,
@@ -1000,7 +1000,7 @@ pub fn add_transition_states_with_terminal_vouts<const TRANSFER: bool>(
             }
         }
     }
-    if let Some(map) = terminal_vouts_by_assignment {
+    if let Some(map) = terminal_seals_by_assignment {
         for key in map.keys() {
             if !used_terminal_assignments.contains(key) {
                 return Err(CompositionError::Unexpected(format!(
@@ -1014,21 +1014,23 @@ pub fn add_transition_states_with_terminal_vouts<const TRANSFER: bool>(
 }
 
 fn assignment_terminal_seal(
-    default_seal: &BuilderSeal<GraphSeal>,
+    default_seal: Option<&BuilderSeal<GraphSeal>>,
     default_vout: Option<u32>,
-    terminal_vouts_by_assignment: Option<&BTreeMap<(String, usize), u32>>,
+    terminal_seals_by_assignment: Option<&BTreeMap<(String, usize), (BuilderSeal<GraphSeal>, u32)>>,
     assignment_key: &(String, usize),
     used_terminal_assignments: &mut BTreeSet<(String, usize)>,
-) -> (BuilderSeal<GraphSeal>, Option<u32>) {
-    if let Some(vout) = terminal_vouts_by_assignment.and_then(|map| map.get(assignment_key)) {
+) -> Result<(BuilderSeal<GraphSeal>, Option<u32>), CompositionError> {
+    if let Some((seal, vout)) = terminal_seals_by_assignment.and_then(|map| map.get(assignment_key)) {
         used_terminal_assignments.insert(assignment_key.clone());
-        (
-            BuilderSeal::Revealed(GraphSeal::with_blinded_vout(*vout, rand::random())),
-            Some(*vout),
-        )
-    } else {
-        (default_seal.clone(), default_vout)
+        return Ok((seal.clone(), Some(*vout)));
     }
+    let Some(default_seal) = default_seal else {
+        return Err(CompositionError::Unexpected(format!(
+            "missing terminal mapping for ABI return '{}#{}' and no default vout is available",
+            assignment_key.0, assignment_key.1
+        )));
+    };
+    Ok((default_seal.clone(), default_vout))
 }
 
 /// Extension trait: call `validate_ext` after `use ...::ConsignmentValidateExt`.
@@ -1079,5 +1081,31 @@ mod tests {
     fn parse_outpoint_payload_rejects_invalid_format() {
         let outr = OutrValue::Bytes(b"not-an-outpoint".to_vec());
         assert!(parse_outpoint_payload(&outr).is_err());
+    }
+
+    #[test]
+    fn assignment_terminal_seal_uses_explicit_mapping_without_default_seal() {
+        let assignment = ("change".to_string(), 0usize);
+        let seal = BuilderSeal::Revealed(GraphSeal::with_blinded_vout(2, rand::random()));
+        let mappings = BTreeMap::from([(assignment.clone(), (seal.clone(), 2u32))]);
+        let mut used = BTreeSet::new();
+
+        let (resolved, vout) =
+            assignment_terminal_seal(None, None, Some(&mappings), &assignment, &mut used)
+                .expect("explicit mapping must not require a default seal");
+
+        assert_eq!(resolved, seal);
+        assert_eq!(vout, Some(2));
+        assert!(used.contains(&assignment));
+    }
+
+    #[test]
+    fn assignment_terminal_seal_rejects_missing_mapping_without_default_seal() {
+        let assignment = ("change".to_string(), 0usize);
+        let mut used = BTreeSet::new();
+
+        let err = assignment_terminal_seal(None, None, None, &assignment, &mut used).unwrap_err();
+
+        assert!(err.to_string().contains("missing terminal mapping"));
     }
 }

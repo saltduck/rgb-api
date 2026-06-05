@@ -7,12 +7,14 @@
 - Add owner change vout declarations with distinct-vout validation.
 - Add terminal vout declarations and ABI return occurrence mapping.
 - Bind mapped ABI returns to their declared terminal seals.
-- Add late-bound final tx outpoint args through the advanced API.
+- Add late-bound final tx outpoint args through the advanced API with stable
+  txid convergence checks.
+- Allow mapped terminal plans to omit legacy `change_vout`.
 - Expose `commitment_txid` in multiparty transition results.
 - Add tests for legacy defaults, owner mapping, distinct-vout failure,
-  terminal mapping, unknown terminal failure, and late-bound arg resolution.
+  terminal mapping, unknown terminal failure, missing mapping failure, explicit
+  mapping without default change seal, and late-bound arg resolution.
 
 ## Verification
 
 - `cargo test -q`
-

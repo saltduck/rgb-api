@@ -12,9 +12,10 @@ The API must allow callers to declare:
 - the participant owner for each RGB input;
 - the RGB change output vout for each participant;
 - terminal vouts and ABI return assignment mappings for transition-owned state;
-- late-bound transition arguments that are resolved against the final unsigned
-  transaction txid after the RGB commitment is written.
+- late-bound transition arguments that are resolved against a stable final
+  unsigned transaction txid after the RGB commitment is written.
 
 Unsupported or incomplete declarations must fail closed with diagnostic errors.
 Callers must not provide raw commitments or bypass `rgb-api` consistency checks.
-
+Late-bound plans that cannot converge to a stable commitment txid must also fail
+closed.

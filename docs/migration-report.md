@@ -16,5 +16,6 @@ Mappings that reference unknown terminals or returns that are not produced fail.
 
 Late-bound args require `build_advanced_transition_on_psbt`, which requires a
 cloneable PSBT so the API can probe the RGB commitment txid without mutating
-stock state.
-
+stock state. The API only commits the final cloned PSBT back to the caller when
+late-bound args converge to a stable commitment txid. Non-converging
+self-referential txid plans fail closed.
