@@ -31,6 +31,7 @@ mod bdk_provider;
 mod bp_provider;
 mod descriptor;
 mod filters;
+pub mod multiparty;
 pub mod pay;
 mod errors;
 mod wallet;
@@ -40,9 +41,13 @@ pub mod scripts;
 pub use descriptor::bp_wallet_integration;
 pub use descriptor::{DescriptorRgb, RgbDescr, TapretKey, WpkhDescr};
 pub use errors::{CompletionError, CompositionError, PayError, WalletError};
+pub use multiparty::{
+    build_transition_on_psbt, MultipartyOutputPlan, MultipartyTransitionInput,
+    MultipartyTransitionPlan, MultipartyTransitionResult,
+};
 pub use pay::{
-    PsbtMeta, TransferParams, WalletProvider, apply_transition_schema_globals_from_contract_state,
-    build_extra_transitions, create_change_output_seal,
+    apply_transition_schema_globals_from_contract_state, build_extra_transitions,
+    create_change_output_seal, PsbtMeta, TransferParams, WalletProvider,
 };
 pub use rgbstd::*;
 pub mod resolvers {

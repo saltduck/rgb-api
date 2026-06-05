@@ -211,6 +211,18 @@ impl RgbPsbtExt<PropKey, Output> for Psbt {
     }
 
     fn dbc_output<D: DbcPsbtProof>(&self) -> Option<&Output> {
+        let mut marked = self.outputs().filter(|output| match D::METHOD {
+            CloseMethod::OpretFirst => output.is_opret_host(),
+            CloseMethod::TapretFirst => output.is_tapret_host(),
+        });
+        if let Some(output) = marked.next() {
+            return match D::METHOD {
+                CloseMethod::TapretFirst if output.script.is_p2tr() => Some(output),
+                CloseMethod::OpretFirst if output.script.is_op_return() => Some(output),
+                _ => None,
+            };
+        }
+
         self.outputs().find(|output| {
             (output.script.is_p2tr() && D::METHOD == CloseMethod::TapretFirst)
                 || (output.script.is_op_return() && D::METHOD == CloseMethod::OpretFirst)
@@ -218,6 +230,22 @@ impl RgbPsbtExt<PropKey, Output> for Psbt {
     }
 
     fn dbc_output_mut<D: DbcPsbtProof>(&mut self) -> Option<(usize, &mut Output)> {
+        let marked_idx = self.outputs().enumerate().find_map(|(i, output)| {
+            let is_marked = match D::METHOD {
+                CloseMethod::OpretFirst => output.is_opret_host(),
+                CloseMethod::TapretFirst => output.is_tapret_host(),
+            };
+            is_marked.then_some(i)
+        });
+        if let Some(idx) = marked_idx {
+            let output = self.output(idx)?;
+            let valid = match D::METHOD {
+                CloseMethod::TapretFirst => output.script.is_p2tr(),
+                CloseMethod::OpretFirst => output.script.is_op_return(),
+            };
+            return valid.then(|| (idx, self.output_mut(idx).unwrap()));
+        }
+
         self.outputs_mut().enumerate().find(|(_i, output)| {
             (output.script.is_p2tr() && D::METHOD == CloseMethod::TapretFirst)
                 || (output.script.is_op_return() && D::METHOD == CloseMethod::OpretFirst)

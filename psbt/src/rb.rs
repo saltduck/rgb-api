@@ -247,6 +247,22 @@ impl RgbPsbtExt<ProprietaryKey, Output> for Psbt {
     }
 
     fn dbc_output<D: DbcPsbtProof>(&self) -> Option<&Output> {
+        let marked_idx = self.outputs.iter().enumerate().find_map(|(i, output)| {
+            let is_marked = match D::METHOD {
+                CloseMethod::OpretFirst => output.is_opret_host(),
+                CloseMethod::TapretFirst => output.is_tapret_host(),
+            };
+            is_marked.then_some(i)
+        });
+        if let Some(idx) = marked_idx {
+            let txout = self.unsigned_tx.output.get(idx)?;
+            let valid = match D::METHOD {
+                CloseMethod::TapretFirst => txout.script_pubkey.is_p2tr(),
+                CloseMethod::OpretFirst => txout.script_pubkey.is_op_return(),
+            };
+            return valid.then(|| &self.outputs[idx]);
+        }
+
         let (idx, _) = self
             .unsigned_tx
             .output
@@ -260,6 +276,22 @@ impl RgbPsbtExt<ProprietaryKey, Output> for Psbt {
     }
 
     fn dbc_output_mut<D: DbcPsbtProof>(&mut self) -> Option<(usize, &mut Output)> {
+        let marked_idx = self.outputs.iter().enumerate().find_map(|(i, output)| {
+            let is_marked = match D::METHOD {
+                CloseMethod::OpretFirst => output.is_opret_host(),
+                CloseMethod::TapretFirst => output.is_tapret_host(),
+            };
+            is_marked.then_some(i)
+        });
+        if let Some(idx) = marked_idx {
+            let txout = self.unsigned_tx.output.get(idx)?;
+            let valid = match D::METHOD {
+                CloseMethod::TapretFirst => txout.script_pubkey.is_p2tr(),
+                CloseMethod::OpretFirst => txout.script_pubkey.is_op_return(),
+            };
+            return valid.then(|| (idx, self.outputs.get_mut(idx).unwrap()));
+        }
+
         let (idx, _) = self
             .unsigned_tx
             .output

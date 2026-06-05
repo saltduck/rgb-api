@@ -690,14 +690,54 @@ pub fn get_interface<const TRANSFER: bool>(
     Ok((interface, interface_libid))
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransitionTerminalOutputs {
+    pub witness_vouts: BTreeSet<u32>,
+    pub explicit_outpoints: BTreeSet<Outpoint>,
+}
+
+impl TransitionTerminalOutputs {
+    fn push_witness_vout(&mut self, vout: u32) {
+        self.witness_vouts.insert(vout);
+    }
+
+    fn push_explicit_outpoint(&mut self, outpoint: Outpoint) {
+        self.explicit_outpoints.insert(outpoint);
+    }
+}
+
 pub fn add_transition_states<const TRANSFER: bool>(
+    consignment: &Consignment<TRANSFER>,
+    abi: &Vec<serde_json::Value>,
+    outputs: &Vec<OutrValue>,
+    main_builder: TransitionBuilder,
+    beneficiary_seal: &BuilderSeal<GraphSeal>,
+    change_seal: &BuilderSeal<GraphSeal>,
+) -> Result<TransitionBuilder, CompositionError> {
+    let (builder, _) = add_transition_states_with_terminals(
+        consignment,
+        abi,
+        outputs,
+        main_builder,
+        beneficiary_seal,
+        change_seal,
+        None,
+        None,
+    )?;
+    Ok(builder)
+}
+
+pub fn add_transition_states_with_terminals<const TRANSFER: bool>(
     consignment: &Consignment<TRANSFER>,
     abi: &Vec<serde_json::Value>,
     outputs: &Vec<OutrValue>,
     mut main_builder: TransitionBuilder,
     beneficiary_seal: &BuilderSeal<GraphSeal>,
     change_seal: &BuilderSeal<GraphSeal>,
-) -> Result<TransitionBuilder, CompositionError> {
+    beneficiary_vout: Option<u32>,
+    change_vout: Option<u32>,
+) -> Result<(TransitionBuilder, TransitionTerminalOutputs), CompositionError> {
+    let mut terminals = TransitionTerminalOutputs::default();
     let mut j  = 0;
     for (i, value) in abi.iter().enumerate() {
         let outr_value = &outputs[j];
@@ -736,6 +776,9 @@ pub fn add_transition_states<const TRANSFER: bool>(
                         beneficiary_seal.clone(),
                         received,
                     )?;
+                    if let Some(vout) = beneficiary_vout {
+                        terminals.push_witness_vout(vout);
+                    }
                 }
             }
             "change" => match abi_reg {
@@ -747,6 +790,9 @@ pub fn add_transition_states<const TRANSFER: bool>(
                             change_seal.clone(),
                             change,
                         )?;
+                        if let Some(vout) = change_vout {
+                            terminals.push_witness_vout(vout);
+                        }
                     }
                 }
                 "r256" => {
@@ -759,6 +805,9 @@ pub fn add_transition_states<const TRANSFER: bool>(
                         change_seal.clone(),
                         RevealedData::new(payload),
                     )?;
+                    if let Some(vout) = change_vout {
+                        terminals.push_witness_vout(vout);
+                    }
                 }
                 "outpoint" => {
                     let raw = parse_outpoint_payload(outr_value)?;
@@ -770,6 +819,9 @@ pub fn add_transition_states<const TRANSFER: bool>(
                         change_seal.clone(),
                         RevealedData::new(payload),
                     )?;
+                    if let Some(vout) = change_vout {
+                        terminals.push_witness_vout(vout);
+                    }
                 }
                 "s16" => {
                     let data = parse_s16_payload(consignment, abi_type, outr_value)?;
@@ -780,6 +832,9 @@ pub fn add_transition_states<const TRANSFER: bool>(
                             CompositionError::Unexpected(format!("String RevealedData: {e}"))
                         })?),
                     )?;
+                    if let Some(vout) = change_vout {
+                        terminals.push_witness_vout(vout);
+                    }
                 }
                 other => {
                     return Err(CompositionError::Unexpected(format!(
@@ -801,6 +856,7 @@ pub fn add_transition_states<const TRANSFER: bool>(
                             owner_seal,
                             amount,
                         )?;
+                        terminals.push_explicit_outpoint(outpoint);
                     }
                     "a8" => {
                         // if *outr_value == OutrValue::Int(0) {
@@ -809,6 +865,7 @@ pub fn add_transition_states<const TRANSFER: bool>(
                         //     )));
                         // }
                         main_builder = main_builder.add_rights_raw(abi_type, owner_seal)?;
+                        terminals.push_explicit_outpoint(outpoint);
                     }
                     "r256" => {
                         let hash = parse_hash256(outr_value)?;
@@ -820,6 +877,7 @@ pub fn add_transition_states<const TRANSFER: bool>(
                             owner_seal,
                             RevealedData::new(payload),
                         )?;
+                        terminals.push_explicit_outpoint(outpoint);
                     }
                     "outpoint" => {
                         let raw = parse_outpoint_payload(outr_value)?;
@@ -831,6 +889,7 @@ pub fn add_transition_states<const TRANSFER: bool>(
                             owner_seal,
                             RevealedData::new(payload),
                         )?;
+                        terminals.push_explicit_outpoint(outpoint);
                     }
                     "s16" => {
                         let data = parse_s16_payload(consignment, abi_type, outr_value)?;
@@ -841,6 +900,7 @@ pub fn add_transition_states<const TRANSFER: bool>(
                                 CompositionError::Unexpected(format!("String RevealedData: {e}"))
                             })?),
                         )?;
+                        terminals.push_explicit_outpoint(outpoint);
                     }
                     other => {
                         return Err(CompositionError::Unexpected(format!(
@@ -876,7 +936,7 @@ pub fn add_transition_states<const TRANSFER: bool>(
             }
         }
     }
-    Ok(main_builder)
+    Ok((main_builder, terminals))
 }
 
 /// Extension trait: call `validate_ext` after `use ...::ConsignmentValidateExt`.

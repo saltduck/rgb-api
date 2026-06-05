@@ -52,6 +52,9 @@ use super::{
     WalletProvider,
 };
 use crate::invoice::RgbInvoice;
+use crate::multiparty::{
+    build_transition_on_psbt, MultipartyTransitionPlan, MultipartyTransitionResult,
+};
 use crate::pay::{
     apply_transition_schema_globals_from_contract_state, build_extra_transitions,
     create_change_output_seal, PsbtMeta,
@@ -159,6 +162,15 @@ impl<W: WalletProvider, S: StashProvider, H: StateProvider, I: IndexProvider>
     ) -> Result<Transfer, CompletionError> {
         self.wallet
             .transfer(&mut self.stock, invoice, psbt, beneficiary_vout)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn transit_with_plan(
+        &mut self,
+        psbt: &mut W::Psbt,
+        plan: &MultipartyTransitionPlan,
+    ) -> Result<MultipartyTransitionResult, WalletError> {
+        build_transition_on_psbt::<S, H, I, W::P, W::O, W::Psbt>(&mut self.stock, psbt, plan)
     }
 
     #[allow(clippy::result_large_err)]
@@ -434,6 +446,13 @@ mod tests {
         H: StateProvider,
         I: IndexProvider,
     >() {
+        let _: fn(
+            &mut RgbWallet<W, S, H, I>,
+            &mut W::Psbt,
+            &MultipartyTransitionPlan,
+        ) -> Result<MultipartyTransitionResult, WalletError> =
+            RgbWallet::<W, S, H, I>::transit_with_plan;
+
         let _: fn(
             &mut RgbWallet<W, S, H, I>,
             ContractId,
