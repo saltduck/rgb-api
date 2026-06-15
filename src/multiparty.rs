@@ -392,9 +392,10 @@ fn build_transition_on_psbt_inner<
     let mut input_type_counts: BTreeMap<AssignmentType, u16> = BTreeMap::new();
 
     for (seal, list) in assignments {
-        assert_expected_assignments(seal, &list, expected_by_seal.get(&seal))?;
+        let selected_assignments =
+            select_input_assignments(seal, list, expected_by_seal.get(&seal))?;
         let owner_id = advanced_plan.input_owners.get(&seal).map(String::as_str);
-        for (opout, state) in list {
+        for (opout, state) in selected_assignments {
             main_builder = main_builder.add_input(opout, state.clone())?;
             *input_type_counts.entry(opout.ty).or_insert(0) += 1;
             if opout.ty != main_assignment_type {
@@ -593,28 +594,45 @@ fn mark_carrier_output<P: RgbPropKeyExt, O: RgbOutExt<P>, Psbt: RgbPsbtExt<P, O>
     Ok(())
 }
 
-fn assert_expected_assignments(
+fn select_input_assignments(
     seal: OutputSeal,
-    actual: &HashMap<rgbstd::Opout, AllocatedState>,
+    actual: HashMap<rgbstd::Opout, AllocatedState>,
     expected: Option<&Vec<(AssignmentType, AllocatedState)>>,
-) -> Result<(), WalletError> {
+) -> Result<Vec<(rgbstd::Opout, AllocatedState)>, WalletError> {
     let Some(expected) = expected else {
-        return Ok(());
+        return Ok(actual.into_iter().collect());
     };
+    if expected.is_empty() {
+        return Ok(actual.into_iter().collect());
+    }
+
+    let mut selected = Vec::with_capacity(expected.len());
     for (assignment_type, expected_state) in expected {
-        let found = actual
+        let matches = actual
             .iter()
-            .any(|(opout, state)| opout.ty == *assignment_type && state == expected_state);
-        if !found {
-            return Err(WalletError::Custom(format!(
-                "specified RGB input {}:{} is missing expected assignment type {}",
-                seal.txid,
-                seal.vout,
-                u16::from(*assignment_type)
-            )));
+            .filter(|(opout, state)| opout.ty == *assignment_type && *state == expected_state)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => {
+                return Err(WalletError::Custom(format!(
+                    "specified RGB input {}:{} is missing expected assignment type {}",
+                    seal.txid,
+                    seal.vout,
+                    u16::from(*assignment_type)
+                )));
+            }
+            [assignment] => selected.push((*assignment.0, assignment.1.clone())),
+            _ => {
+                return Err(WalletError::Custom(format!(
+                    "specified RGB input {}:{} has multiple matching assignments for type {}",
+                    seal.txid,
+                    seal.vout,
+                    u16::from(*assignment_type)
+                )));
+            }
         }
     }
-    Ok(())
+    Ok(selected)
 }
 
 fn owner_change_seal(
@@ -1071,6 +1089,67 @@ mod tests {
     }
 
     #[test]
+    fn empty_expected_assignments_select_all_input_assignments() {
+        let seal = OutputSeal::new(rgbstd::Outpoint::new(dummy_txid(1), 0));
+        let state_a = AllocatedState::Amount(100u64.into());
+        let state_b = AllocatedState::Amount(200u64.into());
+        let opout_a = dummy_opout(1, 0);
+        let opout_b = dummy_opout(2, 1);
+        let actual = HashMap::from([(opout_a, state_a.clone()), (opout_b, state_b.clone())]);
+
+        let selected = select_input_assignments(seal, actual, Some(&vec![])).unwrap();
+
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains(&(opout_a, state_a)));
+        assert!(selected.contains(&(opout_b, state_b)));
+    }
+
+    #[test]
+    fn expected_assignments_select_only_matching_input_assignments() {
+        let seal = OutputSeal::new(rgbstd::Outpoint::new(dummy_txid(1), 0));
+        let selected_state = AllocatedState::Amount(100u64.into());
+        let unselected_state = AllocatedState::Amount(200u64.into());
+        let selected_type = AssignmentType::from(1u16);
+        let unselected_type = AssignmentType::from(2u16);
+        let selected_opout = dummy_opout(1, 0);
+        let unselected_opout = dummy_opout(2, 1);
+        let actual = HashMap::from([
+            (selected_opout, selected_state.clone()),
+            (unselected_opout, unselected_state),
+        ]);
+        let expected = vec![(selected_type, selected_state.clone())];
+
+        let selected = select_input_assignments(seal, actual, Some(&expected)).unwrap();
+
+        assert_eq!(selected, vec![(selected_opout, selected_state)]);
+        assert_eq!(unselected_opout.ty, unselected_type);
+    }
+
+    #[test]
+    fn expected_assignments_missing_match_fails_closed() {
+        let seal = OutputSeal::new(rgbstd::Outpoint::new(dummy_txid(1), 0));
+        let actual = HashMap::from([(dummy_opout(1, 0), AllocatedState::Amount(100u64.into()))]);
+        let expected = vec![(AssignmentType::from(1u16), AllocatedState::Amount(200u64.into()))];
+
+        let err = select_input_assignments(seal, actual, Some(&expected)).unwrap_err();
+
+        assert!(err.to_string().contains("missing expected assignment"));
+    }
+
+    #[test]
+    fn expected_assignments_ambiguous_match_fails_closed() {
+        let seal = OutputSeal::new(rgbstd::Outpoint::new(dummy_txid(1), 0));
+        let state = AllocatedState::Amount(100u64.into());
+        let actual =
+            HashMap::from([(dummy_opout(1, 0), state.clone()), (dummy_opout(1, 1), state.clone())]);
+        let expected = vec![(AssignmentType::from(1u16), state)];
+
+        let err = select_input_assignments(seal, actual, Some(&expected)).unwrap_err();
+
+        assert!(err.to_string().contains("multiple matching assignments"));
+    }
+
+    #[test]
     fn owner_change_vouts_must_have_owner_mapping_for_each_input() {
         let input = dummy_input(0);
         let plan = dummy_plan(MultipartyOutputPlan::new(Some(0), Some(1), 3), vec![input.clone(), dummy_input(1)]);
@@ -1156,6 +1235,14 @@ mod tests {
 
     fn dummy_input(vout: u32) -> MultipartyTransitionInput {
         MultipartyTransitionInput::new(OutputSeal::new(rgbstd::Outpoint::new(dummy_txid(1), vout)))
+    }
+
+    fn dummy_opout(assignment_type: u16, no: u16) -> Opout {
+        Opout::new(
+            OpId::copy_from_slice([assignment_type as u8; 32]).unwrap(),
+            AssignmentType::from(assignment_type),
+            no,
+        )
     }
 
     fn dummy_txid(byte: u8) -> Txid {

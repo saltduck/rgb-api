@@ -7,6 +7,14 @@ The legacy multiparty transition API remains valid:
 - `MultipartyOutputPlan::new(beneficiary_vout, change_vout, carrier_vout)`
   continues to bind all `"change"` ABI returns to the single `change_vout`.
 - Existing callers can keep using `build_transition_on_psbt`.
+- `MultipartyTransitionInput::new(seal)` continues to consume every assignment
+  found on the declared RGB input seal.
+
+Callers can select exact assignments on a declared RGB input seal with
+`MultipartyTransitionInput::with_expected_assignments(seal, assignments)`.
+Non-empty `expected_assignments` are both validation criteria and the exact
+assignment input set. Assignments on the same seal that are not listed must not
+be consumed. Missing or ambiguous exact matches fail closed.
 
 The extended API adds sidecar declarations on `MultipartyAdvancedTransitionPlan`:
 
@@ -34,7 +42,10 @@ let base = MultipartyTransitionPlan {
     transition_name: "demo".to_owned(),
     args: vec![("settler".to_owned(), "placeholder".to_owned())],
     inputs: vec![
-        MultipartyTransitionInput::new(alice_seal),
+        MultipartyTransitionInput::with_expected_assignments(
+            alice_seal,
+            vec![(alice_assignment_type, alice_state)],
+        ),
         MultipartyTransitionInput::new(bob_seal),
     ],
     close_method,
